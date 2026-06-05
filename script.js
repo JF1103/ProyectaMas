@@ -362,31 +362,27 @@ async function upsertMonthlyStatus(transactionId, month, year, status) {
    9b. MOVIMIENTOS DE GASTOS (expense_movements)
    ============================================================ */
 
-// Calcula el gasto real de cada fila a partir de expense_movements (fuente de verdad).
-// Filas sin budgeted_amount (estilo antiguo): usa amount directamente como real.
+// Calcula el gasto real de cada fila exclusivamente desde expense_movements.
+// El campo `amount` NO se usa como real; puede ser legacy o de sincronía interna.
+// budget = budgeted_amount si > 0, sino amount (compatibilidad con datos viejos).
 async function computeRealAmounts(rows) {
-  const withBudget = rows.filter(r => r.budgeted_amount != null);
   const realMap = {};
+  if (!rows.length) return realMap;
 
-  // Antiguo estilo (sin presupuesto separado): amount == real
-  rows.filter(r => r.budgeted_amount == null)
-      .forEach(r => { realMap[r.id] = Math.max(0, +r.amount || 0); });
+  const ids = rows.map(r => r.id);
+  rows.forEach(r => { realMap[r.id] = 0; });
 
-  if (!withBudget.length) return realMap;
-
-  const ids = withBudget.map(r => r.id);
   const { data: movs } = await APP.supabase
     .from('expense_movements')
     .select('expense_id, movement_type, amount')
     .eq('household_id', APP.householdId)
     .in('expense_id', ids);
 
-  withBudget.forEach(r => { realMap[r.id] = 0; });
   (movs || []).forEach(m => {
     if (realMap[m.expense_id] !== undefined)
       realMap[m.expense_id] += m.movement_type === 'add' ? +m.amount : -(+m.amount);
   });
-  withBudget.forEach(r => { realMap[r.id] = Math.max(0, realMap[r.id]); });
+  rows.forEach(r => { realMap[r.id] = Math.max(0, realMap[r.id]); });
   return realMap;
 }
 
@@ -1251,9 +1247,9 @@ async function renderGastosFijos() {
   const rows = await dbSelect('fixed_expenses', { month: APP.currentMonth, year: APP.currentYear });
   APP.cache.fixedExpenses = rows;
 
-  // Real = suma de movimientos (fuente de verdad); presupuesto = budgeted_amount
+  // Real desde movimientos; presupuesto = budgeted_amount > 0 ó amount (legacy)
   const realMap       = await computeRealAmounts(rows);
-  const totalBudgeted = rows.reduce((s,r) => s + (r.budgeted_amount != null ? +r.budgeted_amount : +r.amount || 0), 0);
+  const totalBudgeted = rows.reduce((s,r) => s + (+r.budgeted_amount > 0 ? +r.budgeted_amount : +r.amount || 0), 0);
   const totalReal     = rows.reduce((s,r) => s + (realMap[r.id] ?? 0), 0);
   const totalPaid     = rows.filter(r=>r.status==='paid').reduce((s,r)=>s+(realMap[r.id]??0),0);
   const globalDiff    = totalBudgeted - totalReal;   // positivo = restante, negativo = excedido
@@ -1319,14 +1315,13 @@ async function renderGastosFijos() {
 }
 
 function fixedRow(r, realAmount) {
-  const hasBudget = r.budgeted_amount != null;
-  const budget    = hasBudget ? +r.budgeted_amount : +r.amount || 0;
-  const real      = hasBudget ? (realAmount ?? 0) : +r.amount || 0;
+  // budget: budgeted_amount si fue definido (> 0), sino el amount viejo como fallback
+  const budget = +r.budgeted_amount > 0 ? +r.budgeted_amount : (+r.amount || 0);
+  const real   = realAmount ?? 0;
 
   let amountCell;
-  if (!hasBudget) {
-    // Sin presupuesto cargado: mostrar amount directo
-    amountCell = `<strong>${fmtARS(real)}</strong>`;
+  if (!budget && !real) {
+    amountCell = `<strong class="mono" style="color:var(--text-3)">Sin presupuesto</strong>`;
   } else {
     const diff = budget - real;   // positivo = restante, negativo = excedido
     let diffSpan;
@@ -1625,9 +1620,9 @@ async function renderGastosVariables() {
   const rows = await dbSelect('variable_expenses', { month: APP.currentMonth, year: APP.currentYear });
   APP.cache.varExpenses = rows;
 
-  // Real desde movimientos; presupuesto desde budgeted_amount
+  // Real desde movimientos; presupuesto = budgeted_amount > 0 ó amount (legacy)
   const realMap       = await computeRealAmounts(rows);
-  const totalBudgetedV = rows.reduce((s,r) => s + (r.budgeted_amount != null ? +r.budgeted_amount : +r.amount || 0), 0);
+  const totalBudgetedV = rows.reduce((s,r) => s + (+r.budgeted_amount > 0 ? +r.budgeted_amount : +r.amount || 0), 0);
   const totalRealV     = rows.reduce((s,r) => s + (realMap[r.id] ?? 0), 0);
   const globalDiffV    = totalBudgetedV - totalRealV;
 
@@ -1697,13 +1692,12 @@ async function renderGastosVariables() {
 }
 
 function varRow(r, realAmount) {
-  const hasBudget = r.budgeted_amount != null;
-  const budget    = hasBudget ? +r.budgeted_amount : +r.amount || 0;
-  const real      = hasBudget ? (realAmount ?? 0) : +r.amount || 0;
+  const budget = +r.budgeted_amount > 0 ? +r.budgeted_amount : (+r.amount || 0);
+  const real   = realAmount ?? 0;
 
   let amountCell;
-  if (!hasBudget) {
-    amountCell = `<strong>${fmtARS(real)}</strong>`;
+  if (!budget && !real) {
+    amountCell = `<strong class="mono" style="color:var(--text-3)">Sin presupuesto</strong>`;
   } else {
     const diff = budget - real;
     let diffSpan;
