@@ -377,10 +377,13 @@ async function computeExpenseMovementSummary(rows) {
     .eq('household_id', APP.householdId)
     .in('expense_id', ids);
 
+  console.log('[computeExpenseMovementSummary] movimientos recibidos:', movs?.length ?? 0, movs);
   (movs || []).forEach(m => {
     if (!map[m.expense_id]) return;
-    if (m.movement_type === 'add') map[m.expense_id].spentReal += +m.amount;
-    else                           map[m.expense_id].reduction += +m.amount;
+    const mType = (m.movement_type || '').trim();
+    if (mType === 'add')      map[m.expense_id].spentReal  += +m.amount;
+    else if (mType === 'subtract') map[m.expense_id].reduction += +m.amount;
+    else console.warn('[computeExpenseMovementSummary] movement_type desconocido:', JSON.stringify(m.movement_type));
   });
   rows.forEach(r => {
     const budgetGross = getExpenseBudget(r);
@@ -444,25 +447,32 @@ function openMovementForm(expenseId, expenseType, expenseDesc) {
 }
 
 async function saveMovement(expenseId, expenseType) {
-  const movType = $('mov-type').value;
+  // Leer tipo desde el select de forma explícita; normalizar para evitar edge-cases
+  const movTypeEl = document.getElementById('mov-type');
+  const movType   = (movTypeEl?.options?.[movTypeEl.selectedIndex]?.value || '').trim();
+
   const amount  = parseFloat($('mov-amount').value);
   const date    = $('mov-date').value;
   const desc    = $('mov-desc').value.trim();
   const notes   = $('mov-notes').value.trim();
 
+  console.log('[saveMovement] expense_id:', expenseId, 'expense_type:', expenseType,
+    'movement_type:', movType, 'amount:', amount, 'description:', desc);
+
+  if (!movType || (movType !== 'add' && movType !== 'subtract'))
+    return toast('Tipo de movimiento inválido', 'warning');
   if (!desc)                        return toast('Ingresá una descripción', 'warning');
   if (isNaN(amount) || amount <= 0) return toast('Monto inválido', 'warning');
 
-  // subtract = descuento del presupuesto reservado; no afecta spentReal ni puede quedar negativo
   const { data: existingMovs } = await APP.supabase
     .from('expense_movements')
     .select('movement_type, amount')
     .eq('household_id', APP.householdId)
     .eq('expense_id', expenseId);
 
-  // amount en DB sincroniza solo el gasto real (suma de add movements)
+  // amount en DB = spentReal (solo suma de movimientos 'add')
   const newSpentReal = (existingMovs || [])
-    .filter(m => m.movement_type === 'add')
+    .filter(m => (m.movement_type || '').trim() === 'add')
     .reduce((s, m) => s + +m.amount, 0) + (movType === 'add' ? amount : 0);
 
   const table = expenseType === 'fixed' ? 'fixed_expenses' : 'variable_expenses';
@@ -477,7 +487,10 @@ async function saveMovement(expenseId, expenseType) {
     toast('Movimiento agregado ✓');
     if (expenseType === 'fixed') renderGastosFijos();
     else renderGastosVariables();
-  } catch {}
+  } catch(e) {
+    console.error('[saveMovement] Error al guardar movimiento:', e);
+    toast('Error al guardar el movimiento. Revisá la consola.', 'error');
+  }
 }
 
 async function viewMovements(expenseId, expenseType, expenseDesc) {
@@ -488,9 +501,9 @@ async function viewMovements(expenseId, expenseType, expenseDesc) {
   const rows = movements.length
     ? movements.map(m => `<tr>
         <td style="font-size:.8rem">${m.date ? fmtDate(m.date) : '—'}</td>
-        <td><span class="badge ${m.movement_type==='add'?'badge--success':'badge--warning'}">${m.movement_type==='add'?'⊕ Gasto real':'⊖ Descuento'}</span></td>
-        <td class="mono" style="text-align:right;font-weight:600;color:${m.movement_type==='add'?'var(--success)':'var(--warning)'}">
-          ${m.movement_type==='add'?'+':'−'} ${fmtARS(m.amount)}
+        <td><span class="badge ${(m.movement_type||'').trim()==='add'?'badge--success':'badge--warning'}">${(m.movement_type||'').trim()==='add'?'⊕ Gasto real':'⊖ Descuento'}</span></td>
+        <td class="mono" style="text-align:right;font-weight:600;color:${(m.movement_type||'').trim()==='add'?'var(--success)':'var(--warning)'}">
+          ${(m.movement_type||'').trim()==='add'?'+':'−'} ${fmtARS(m.amount)}
         </td>
         <td style="font-size:.85rem">${m.description}</td>
         <td style="font-size:.75rem;color:var(--text-3)">${m.notes||'—'}</td>
