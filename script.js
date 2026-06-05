@@ -556,6 +556,56 @@ function txnARS(t) {
   return (usd > 0 && rate > 0) ? usd * rate : 0;
 }
 
+// ── Fechas automáticas de tarjetas ──────────────────────────
+// Mueve sábado o domingo al lunes siguiente.
+function getNextBusinessDay(date) {
+  const d = new Date(date.getTime());
+  const dow = d.getDay(); // 0=dom, 6=sáb
+  if (dow === 6) d.setDate(d.getDate() + 2);
+  else if (dow === 0) d.setDate(d.getDate() + 1);
+  return d;
+}
+
+// Detecta la regla automática de una tarjeta por banco/nombre.
+// Devuelve { closingDay, dueDay, dueMonthOffset } o null si no hay coincidencia.
+function detectCardRule(card) {
+  const t = ((card.name || '') + ' ' + (card.bank || '')).toLowerCase();
+  if (t.includes('bbva') && t.includes('visa'))
+    return { closingDay: 28, dueDay: 5,  dueMonthOffset: 1 };
+  if ((t.includes('mercado pago') || t.includes('mercadopago') || t.includes('mp ') || t.startsWith('mp')) && t.includes('mastercard'))
+    return { closingDay: 5,  dueDay: 10, dueMonthOffset: 0 };
+  if (t.includes('galicia') && t.includes('visa'))
+    return { closingDay: 21, dueDay: 1,  dueMonthOffset: 1 };
+  if (t.includes('galicia') && t.includes('mastercard'))
+    return { closingDay: 21, dueDay: 1,  dueMonthOffset: 1 };
+  return null;
+}
+
+// Devuelve { closingDate, dueDate } en formato YYYY-MM-DD para el mes/año dado.
+// Prioridad: closing_day/due_day guardados > auto-detección > fechas manuales.
+// Si auto_dates_enabled === false, retorna directamente las fechas manuales.
+function calculateCardDates(card, month, year) {
+  const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  let closingDay, dueDay, dueMonthOffset;
+  if (card.auto_dates_enabled === false) {
+    return { closingDate: card.closing_date || null, dueDate: card.due_date || null };
+  }
+  if (card.closing_day != null && card.due_day != null) {
+    closingDay = +card.closing_day;
+    dueDay     = +card.due_day;
+    dueMonthOffset = +(card.due_month_offset ?? 0);
+  } else {
+    const rule = detectCardRule(card);
+    if (!rule) return { closingDate: card.closing_date || null, dueDate: card.due_date || null };
+    closingDay = rule.closingDay; dueDay = rule.dueDay; dueMonthOffset = rule.dueMonthOffset;
+  }
+  const closing = getNextBusinessDay(new Date(year, month - 1, closingDay));
+  const dueM0   = (month - 1 + dueMonthOffset) % 12;
+  const dueY    = year + Math.floor((month - 1 + dueMonthOffset) / 12);
+  const due     = getNextBusinessDay(new Date(dueY, dueM0, dueDay));
+  return { closingDate: iso(closing), dueDate: iso(due) };
+}
+
 const CAT_BADGE = {
   // Gastos fijos
   'Vivienda':        { bg:'rgba(56,189,248,.15)',  color:'#38bdf8' },
@@ -776,12 +826,17 @@ async function renderDashboard() {
   if (pctGastado > 90) alerts.push({ type:'warning', msg:`Gastaste el ${pctGastado.toFixed(0)}% de tus ingresos` });
   cards.forEach(c => {
     const cs = getCardClosingStatus(c);
+    const ds = getCardDueStatus(c);
     if (cs.status === 'today')
       alerts.push({ type:'danger',  msg:`${c.name} cierra hoy` });
     else if (cs.status === 'closed')
       alerts.push({ type:'warning', msg:`${c.name} ya cerró. Podés usarla.` });
     else if (cs.status === 'open' && cs.daysUntil !== null && cs.daysUntil <= 3)
       alerts.push({ type:'warning', msg:`${c.name} cierra en ${cs.daysUntil} día${cs.daysUntil===1?'':'s'}` });
+    if (ds.status === 'today')
+      alerts.push({ type:'danger',  msg:`${c.name} vence hoy` });
+    else if (ds.status === 'open' && ds.daysUntil !== null && ds.daysUntil <= 3)
+      alerts.push({ type:'warning', msg:`${c.name} vence en ${ds.daysUntil} día${ds.daysUntil===1?'':'s'}` });
   });
 
   sec.innerHTML = `
@@ -1627,12 +1682,23 @@ const DEFAULT_CARDS = [
   { name:'Mastercard Mari',    holder:'Mari',  bank:'Banco', color:'#dc2626' },
 ];
 
-function getCardClosingStatus(card) {
-  if (!card.closing_date) return { status: 'open', daysUntil: null };
+function getCardClosingStatus(card, month = APP.currentMonth, year = APP.currentYear) {
+  const { closingDate } = calculateCardDates(card, month, year);
+  if (!closingDate) return { status: 'open', daysUntil: null };
   const todayStr = today();
-  if (card.closing_date === todayStr) return { status: 'today', daysUntil: 0 };
-  if (card.closing_date < todayStr)  return { status: 'closed', daysUntil: null };
-  const diff = Math.ceil((new Date(card.closing_date + 'T00:00:00') - new Date()) / 86400000);
+  if (closingDate === todayStr) return { status: 'today', daysUntil: 0 };
+  if (closingDate < todayStr)  return { status: 'closed', daysUntil: null };
+  const diff = Math.ceil((new Date(closingDate + 'T00:00:00') - new Date()) / 86400000);
+  return { status: 'open', daysUntil: diff };
+}
+
+function getCardDueStatus(card, month = APP.currentMonth, year = APP.currentYear) {
+  const { dueDate } = calculateCardDates(card, month, year);
+  if (!dueDate) return { status: 'open', daysUntil: null };
+  const todayStr = today();
+  if (dueDate === todayStr) return { status: 'today', daysUntil: 0 };
+  if (dueDate < todayStr)  return { status: 'overdue', daysUntil: null };
+  const diff = Math.ceil((new Date(dueDate + 'T00:00:00') - new Date()) / 86400000);
   return { status: 'open', daysUntil: diff };
 }
 
@@ -1760,16 +1826,17 @@ function creditCardVisual(card, total, txns) {
   const amountHTML = `<div class="card-amount-value">${fmtARS(total)}</div>`
     + (usdTotal > 0 ? `<div style="font-size:.72rem;color:rgba(255,255,255,.75);margin-top:.1rem">${fmtUSD(usdTotal)} USD</div>` : '');
 
+  const { closingDate: effClosing, dueDate: effDue } = calculateCardDates(card, APP.currentMonth, APP.currentYear);
   const cs = getCardClosingStatus(card);
-  const statusBadge = !card.closing_date ? '' :
+  const statusBadge = !effClosing ? '' :
     cs.status === 'today'  ? `<span class="card-status-badge card-status-badge--today">Cierra hoy</span>` :
     cs.status === 'closed' ? `<span class="card-status-badge card-status-badge--closed">Ya cerró</span>` :
                              `<span class="card-status-badge card-status-badge--open">Abierta</span>`;
 
-  const dateInfo = card.closing_date
+  const dateInfo = (effClosing || effDue)
     ? `<div class="card-dates">
-         <span>Cierre: ${fmtDate(card.closing_date)}</span>
-         ${card.due_date ? `<span>Vto: ${fmtDate(card.due_date)}</span>` : ''}
+         ${effClosing ? `<span>Cierre: ${fmtDate(effClosing)}</span>` : ''}
+         ${effDue    ? `<span>Vto: ${fmtDate(effDue)}</span>` : ''}
        </div>`
     : '';
 
@@ -1847,13 +1914,14 @@ async function showCardTransactions(cardId, txnsParam = null, cardsParam = null)
         </div>
         <div style="display:flex;gap:.5rem;flex-wrap:wrap">
           <button class="btn btn--ghost btn--sm" onclick="editCard('${card.id}')">⚙ Configurar tarjeta</button>
+          <button class="btn btn--ghost btn--sm" onclick="recalcCardDates('${card.id}')">📅 Recalcular fechas</button>
           <button class="btn btn--ghost btn--sm" onclick="deleteCard('${card.id}','${card.name.replace(/'/g,"\\'")}')">🗑 Eliminar tarjeta</button>
           ${totalUSD > 0 ? `<button class="btn btn--outline btn--sm" onclick="openApplyRateModal('${card.id}')">💱 Cotización USD</button>` : ''}
           <button class="btn btn--primary" onclick="openTxnForm('${card.id}')">+ Agregar consumo</button>
         </div>
       </div>
 
-      ${cs.status === 'closed' && card.closing_date ? `
+      ${cs.status === 'closed' ? `
       <div class="alert-item alert-item--warning" style="margin-bottom:.75rem;display:flex;align-items:center;gap:.5rem">
         <span>⚠</span>
         <span>Esta tarjeta ya cerró. Podés usarla para el próximo resumen.</span>
@@ -1989,7 +2057,7 @@ function openTxnForm(cardId, data = null) {
     : (data?.converted_ars ? fmtARS(data.converted_ars) : '—');
   const cardObj = (APP.cache.cards||[]).find(c => c.id === cardId);
   const csCard  = cardObj ? getCardClosingStatus(cardObj) : null;
-  const closedWarning = !isEdit && csCard && cardObj?.closing_date && csCard.status !== 'open'
+  const closedWarning = !isEdit && csCard && csCard.status !== 'open'
     ? csCard.status === 'closed'
       ? `<div class="alert-item alert-item--warning" style="margin-bottom:1rem;font-size:.82rem;display:flex;align-items:center;gap:.5rem">
            <span>⚠</span><span>Esta tarjeta ya cerró. Este consumo podría impactar en el próximo resumen.</span>
@@ -2249,14 +2317,44 @@ function openCardForm(data = null) {
         </div>
         <input type="hidden" id="cd-color" value="${data?.color||'#1a56db'}">
       </div>
-      <div class="field-row">
-        <div class="field-group">
-          <label class="field-label">Fecha de cierre del resumen</label>
-          <input id="cd-closing" type="date" class="field-input" value="${data?.closing_date||''}">
+      <div class="field-group">
+        <label style="display:flex;align-items:center;gap:.6rem;cursor:pointer;padding:.5rem .75rem;background:var(--bg-3);border-radius:var(--radius-md);border:1px solid var(--border)">
+          <input type="checkbox" id="cd-auto-dates" ${data?.auto_dates_enabled?'checked':''} onchange="toggleCardDateMode()" style="accent-color:#818cf8;width:1rem;height:1rem;cursor:pointer;flex-shrink:0">
+          <span style="font-size:.85rem;font-weight:500;color:var(--text-1)">📅 Calcular fechas automáticamente por regla</span>
+        </label>
+      </div>
+      <div id="cd-auto-fields" class="${data?.auto_dates_enabled?'':'hidden'}">
+        <div class="field-row">
+          <div class="field-group">
+            <label class="field-label">Día de cierre del mes</label>
+            <input id="cd-closing-day" type="number" class="field-input" min="1" max="31" placeholder="Ej: 21" value="${data?.closing_day||''}" oninput="previewCardDates()">
+          </div>
+          <div class="field-group">
+            <label class="field-label">Día de vencimiento</label>
+            <input id="cd-due-day" type="number" class="field-input" min="1" max="31" placeholder="Ej: 1" value="${data?.due_day||''}" oninput="previewCardDates()">
+          </div>
         </div>
         <div class="field-group">
-          <label class="field-label">Fecha de vencimiento del pago</label>
-          <input id="cd-due" type="date" class="field-input" value="${data?.due_date||''}">
+          <label class="field-label">Mes del vencimiento</label>
+          <select id="cd-due-offset" class="field-select" onchange="previewCardDates()">
+            <option value="0" ${(+(data?.due_month_offset??0))===0?'selected':''}>Mismo mes del cierre</option>
+            <option value="1" ${(+(data?.due_month_offset??0))===1?'selected':''}>Mes siguiente al cierre</option>
+          </select>
+        </div>
+        <div id="cd-dates-preview" style="font-size:.82rem;color:var(--text-2);padding:.5rem .75rem;background:var(--bg-3);border-radius:var(--radius-md);line-height:1.6">
+          Completá los días para ver la vista previa
+        </div>
+      </div>
+      <div id="cd-manual-fields" class="${data?.auto_dates_enabled?'hidden':''}">
+        <div class="field-row">
+          <div class="field-group">
+            <label class="field-label">Fecha de cierre del resumen</label>
+            <input id="cd-closing" type="date" class="field-input" value="${data?.closing_date||''}">
+          </div>
+          <div class="field-group">
+            <label class="field-label">Fecha de vencimiento del pago</label>
+            <input id="cd-due" type="date" class="field-input" value="${data?.due_date||''}">
+          </div>
         </div>
       </div>
       <div class="form-actions">
@@ -2279,12 +2377,17 @@ async function saveCard() {
   const name = $('cd-name').value.trim();
   const holder = $('cd-holder').value.trim();
   if (!name || !holder) return toast('Nombre y titular son obligatorios', 'warning');
+  const isAuto = !!$('cd-auto-dates')?.checked;
   try {
     await dbInsert('credit_cards', {
       name, holder, bank: $('cd-bank').value.trim()||null,
       last_four: $('cd-last4').value.trim()||null, color: $('cd-color').value,
-      closing_date: $('cd-closing').value || null,
-      due_date: $('cd-due').value || null
+      auto_dates_enabled: isAuto,
+      closing_day:       isAuto ? (parseInt($('cd-closing-day')?.value)||null) : null,
+      due_day:           isAuto ? (parseInt($('cd-due-day')?.value)||null) : null,
+      due_month_offset:  isAuto ? (parseInt($('cd-due-offset')?.value)??0) : 0,
+      closing_date:      isAuto ? null : ($('cd-closing')?.value || null),
+      due_date:          isAuto ? null : ($('cd-due')?.value || null)
     });
     closeModal(); toast('Tarjeta creada ✓'); renderTarjetas();
   } catch {}
@@ -2294,14 +2397,89 @@ async function updateCard(id) {
   const name = $('cd-name').value.trim();
   const holder = $('cd-holder').value.trim();
   if (!name || !holder) return toast('Nombre y titular son obligatorios', 'warning');
+  const isAuto = !!$('cd-auto-dates')?.checked;
   try {
     await dbUpdate('credit_cards', id, {
       name, holder, bank: $('cd-bank').value.trim()||null,
       last_four: $('cd-last4').value.trim()||null, color: $('cd-color').value,
-      closing_date: $('cd-closing').value || null,
-      due_date: $('cd-due').value || null
+      auto_dates_enabled: isAuto,
+      closing_day:       isAuto ? (parseInt($('cd-closing-day')?.value)||null) : null,
+      due_day:           isAuto ? (parseInt($('cd-due-day')?.value)||null) : null,
+      due_month_offset:  isAuto ? (parseInt($('cd-due-offset')?.value)??0) : 0,
+      closing_date:      isAuto ? null : ($('cd-closing')?.value || null),
+      due_date:          isAuto ? null : ($('cd-due')?.value || null)
     });
     closeModal(); toast('Tarjeta actualizada ✓'); renderTarjetas();
+  } catch {}
+}
+
+function toggleCardDateMode() {
+  const isAuto = !!document.getElementById('cd-auto-dates')?.checked;
+  document.getElementById('cd-auto-fields')?.classList.toggle('hidden', !isAuto);
+  document.getElementById('cd-manual-fields')?.classList.toggle('hidden', isAuto);
+  if (isAuto) previewCardDates();
+}
+
+function previewCardDates() {
+  const closingDay = parseInt(document.getElementById('cd-closing-day')?.value);
+  const dueDay     = parseInt(document.getElementById('cd-due-day')?.value);
+  const offset     = parseInt(document.getElementById('cd-due-offset')?.value ?? 0);
+  const preview    = document.getElementById('cd-dates-preview');
+  if (!preview) return;
+  if (!closingDay || !dueDay || closingDay < 1 || dueDay < 1) {
+    preview.textContent = 'Completá los días para ver la vista previa';
+    return;
+  }
+  const fake = { closing_day: closingDay, due_day: dueDay, due_month_offset: offset };
+  const dates = calculateCardDates(fake, APP.currentMonth, APP.currentYear);
+  const label = new Date(APP.currentYear, APP.currentMonth - 1).toLocaleString('es-AR', { month: 'long', year: 'numeric' });
+  preview.innerHTML = `<strong>Vista previa — ${label}:</strong><br>Cierre: ${fmtDate(dates.closingDate) || '—'} &nbsp;·&nbsp; Vto: ${fmtDate(dates.dueDate) || '—'}`;
+}
+
+function recalcCardDates(cardId) {
+  const card = (APP.cache.cards || []).find(c => c.id === cardId);
+  if (!card) return;
+  const rule = detectCardRule(card) ||
+    (card.closing_day != null && card.due_day != null
+      ? { closingDay: card.closing_day, dueDay: card.due_day, dueMonthOffset: +(card.due_month_offset ?? 0) }
+      : null);
+  if (!rule) return toast('No se encontró una regla para esta tarjeta. Configurá el día de cierre/vencimiento en ⚙ Configurar tarjeta.', 'warning', 5000);
+
+  const { closingDay, dueDay, dueMonthOffset } = rule;
+  const fake  = { closing_day: closingDay, due_day: dueDay, due_month_offset: dueMonthOffset };
+  const dates = calculateCardDates(fake, APP.currentMonth, APP.currentYear);
+  const label = new Date(APP.currentYear, APP.currentMonth - 1).toLocaleString('es-AR', { month: 'long', year: 'numeric' });
+
+  openModal(`
+    <h2 class="modal-title">Recalcular fechas — ${card.name}</h2>
+    <p style="font-size:.85rem;color:var(--text-2);margin-bottom:1rem">Regla detectada para <strong>${label}</strong>:</p>
+    <div style="background:var(--bg-3);border-radius:var(--radius-md);padding:.75rem 1rem;margin-bottom:1.25rem;font-size:.85rem;line-height:1.8">
+      Cierre: día <strong>${closingDay}</strong> del mes<br>
+      Vencimiento: día <strong>${dueDay}</strong> del ${dueMonthOffset===1?'mes siguiente':'mismo mes'}<br>
+      <span style="color:var(--text-3);font-size:.75rem">(sábados y domingos se mueven al lunes siguiente)</span><br><br>
+      📅 <strong>Cierre: ${fmtDate(dates.closingDate) || '—'}</strong><br>
+      📅 <strong>Vencimiento: ${fmtDate(dates.dueDate) || '—'}</strong>
+    </div>
+    <p style="font-size:.8rem;color:var(--text-3);margin-bottom:1.25rem">Al aceptar, la tarjeta usará esta regla para todos los meses.</p>
+    <div class="form-actions">
+      <button class="btn btn--ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn--primary" onclick="applyCardAutoRule('${cardId}',${closingDay},${dueDay},${dueMonthOffset})">Aplicar regla</button>
+    </div>`);
+}
+
+async function applyCardAutoRule(cardId, closingDay, dueDay, dueMonthOffset) {
+  try {
+    await dbUpdate('credit_cards', cardId, {
+      auto_dates_enabled: true,
+      closing_day:        +closingDay,
+      due_day:            +dueDay,
+      due_month_offset:   +dueMonthOffset,
+      closing_date:       null,
+      due_date:           null
+    });
+    closeModal();
+    toast('Fechas automáticas configuradas ✓');
+    renderTarjetas();
   } catch {}
 }
 
@@ -3519,8 +3697,7 @@ async function generateMonthlyPDF() {
             ${card.bank?' <span class="card-meta">| Banco: '+card.bank+'</span>':''}
           </div>
           <div style="text-align:right">
-            ${card.closing_date?`<div class="card-meta">Cierre: ${fd(card.closing_date)}</div>`:''}
-            ${card.due_date?`<div class="card-meta">Vencimiento: ${fd(card.due_date)}</div>`:''}
+            ${(()=>{ const d=calculateCardDates(card,APP.currentMonth,APP.currentYear); return (d.closingDate?`<div class="card-meta">Cierre: ${fd(d.closingDate)}</div>`:'')+( d.dueDate?`<div class="card-meta">Vencimiento: ${fd(d.dueDate)}</div>`:''); })()}
           </div>
         </div>
         <div class="card-totals-row">

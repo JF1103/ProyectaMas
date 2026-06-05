@@ -453,6 +453,16 @@ WHERE
   AND (converted_ars IS NULL OR converted_ars = 0);
 
 -- ============================================================
+-- MIGRACIÓN: Fechas automáticas por regla para tarjetas
+-- Ejecutar en Supabase Dashboard > SQL Editor
+-- Columnas opcionales; no borran ni modifican datos existentes.
+-- ============================================================
+ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS auto_dates_enabled BOOLEAN DEFAULT false;
+ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS closing_day        SMALLINT;
+ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS due_day            SMALLINT;
+ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS due_month_offset   SMALLINT DEFAULT 0;
+
+-- ============================================================
 -- ACTIVAR REALTIME (ejecutar en Supabase Dashboard > Replication)
 -- O agregar tablas en: Settings > API > Realtime
 -- ============================================================
