@@ -545,6 +545,17 @@ const fmtARS = n => new Intl.NumberFormat('es-AR', { style:'currency', currency:
 const fmtUSD = n => new Intl.NumberFormat('es-AR', { style:'currency', currency:'USD', minimumFractionDigits:2, maximumFractionDigits:2 }).format(n||0);
 const fmtPct = n => `${(n||0).toFixed(1)}%`;
 
+// Retorna el equivalente ARS de una transacción de tarjeta.
+// USD: usa converted_ars primero; si es 0/null, cae a amount_usd * dollar_rate; si tampoco, 0.
+function txnARS(t) {
+  if (t.currency !== 'USD') return +t.amount_ars || 0;
+  const conv = +t.converted_ars || 0;
+  if (conv > 0) return conv;
+  const usd  = +t.amount_usd  || 0;
+  const rate = +t.dollar_rate || 0;
+  return (usd > 0 && rate > 0) ? usd * rate : 0;
+}
+
 const CAT_BADGE = {
   // Gastos fijos
   'Vivienda':        { bg:'rgba(56,189,248,.15)',  color:'#38bdf8' },
@@ -741,10 +752,10 @@ async function renderDashboard() {
   const totalFixedBudgeted  = fixed.reduce((s,r) => s + (+r.budgeted_amount || +r.amount||0), 0);
   const totalVariable       = variable.reduce((s,r) => s + (+r.amount||0), 0);
   const totalVarBudgeted    = variable.reduce((s,r) => s + (+r.budgeted_amount || +r.amount||0), 0);
-  const totalCards     = allTxns.reduce((s,r) => s + (r.currency==='USD'? (+r.converted_ars||0) : (+r.amount_ars||0)), 0);
+  const totalCards     = allTxns.reduce((s,r) => s + txnARS(r), 0);
   const totalInstall   = installments.reduce((s,r) => s + (+r.installment_amount||0), 0);
   const totalPaid      = fixed.filter(r=>r.status==='paid').reduce((s,r)=>s+(+r.amount||0),0)
-                       + allTxns.filter(r=>r.status==='paid').reduce((s,r)=>s+(r.currency==='USD'?(+r.converted_ars||0):(+r.amount_ars||0)),0);
+                       + allTxns.filter(r=>r.status==='paid').reduce((s,r)=>s+txnARS(r),0);
   const totalPending   = totalFixed + totalVariable + totalCards + totalInstall - totalPaid;
   const saldo          = totalIncome - totalFixed - totalVariable - totalCards - totalInstall;
   const pctGastado     = totalIncome > 0 ? Math.min(100, ((totalFixed+totalVariable+totalCards+totalInstall)/totalIncome)*100) : 0;
@@ -1700,7 +1711,7 @@ async function renderTarjetas() {
   // Calcular totales por tarjeta
   const cardTotals = {};
   txns.forEach(t => {
-    const amt = t.currency === 'USD' ? (+t.converted_ars||0) : (+t.amount_ars||0);
+    const amt = txnARS(t);
     cardTotals[t.card_id] = (cardTotals[t.card_id]||0) + amt;
   });
   const totalGeneral = Object.values(cardTotals).reduce((s,v)=>s+v, 0);
@@ -1803,11 +1814,11 @@ async function showCardTransactions(cardId, txnsParam = null, cardsParam = null)
 
   const totalARS      = filteredTxns.filter(t=>t.currency==='ARS').reduce((s,t)=>s+(+t.amount_ars||0), 0);
   const totalUSD      = filteredTxns.filter(t=>t.currency==='USD').reduce((s,t)=>s+(+t.amount_usd||0), 0);
-  const totalUSDinARS = filteredTxns.filter(t=>t.currency==='USD').reduce((s,t)=>s+(+t.converted_ars||0), 0);
+  const totalUSDinARS = filteredTxns.filter(t=>t.currency==='USD').reduce((s,t)=>s+txnARS(t), 0);
   const totalCombined = totalARS + totalUSDinARS;
   const paidARS       = filteredTxns.filter(t=>t.currency==='ARS'&&t.status==='paid').reduce((s,t)=>s+(+t.amount_ars||0), 0);
   const paidUSD       = filteredTxns.filter(t=>t.currency==='USD'&&t.status==='paid').reduce((s,t)=>s+(+t.amount_usd||0), 0);
-  const paidUSDinARS  = filteredTxns.filter(t=>t.currency==='USD'&&t.status==='paid').reduce((s,t)=>s+(+t.converted_ars||0), 0);
+  const paidUSDinARS  = filteredTxns.filter(t=>t.currency==='USD'&&t.status==='paid').reduce((s,t)=>s+txnARS(t), 0);
   const totalPaid     = paidARS + paidUSDinARS;
   const totalPending  = totalCombined - totalPaid;
 
@@ -1922,7 +1933,7 @@ async function applyUSDRate(cardId) {
 }
 
 function txnRow(t, cardId) {
-  const amtARS = t.currency==='USD' ? (+t.converted_ars||0) : (+t.amount_ars||0);
+  const amtARS = txnARS(t);
   const arsDisplay = t.currency==='USD' && amtARS===0 && (+t.amount_usd||0)>0
     ? '<span style="font-size:.72rem;color:var(--warning)" title="Sin cotización — editá el consumo para agregar la cotización aplicada">⚠ Sin cotiz.</span>'
     : fmtARS(amtARS);
@@ -2526,7 +2537,7 @@ async function renderAhorro() {
   const totalIncome   = incomes.reduce((s,r) => s + (+r.amount||0), 0);
   const totalFixed    = fixed.reduce((s,r) => s + (+r.amount||0), 0);
   const totalVariable = variable.reduce((s,r) => s + (+r.amount||0), 0);
-  const totalCards    = allTxns.reduce((s,t) => s + (t.currency==='USD'?(+t.converted_ars||0):(+t.amount_ars||0)), 0);
+  const totalCards    = allTxns.reduce((s,t) => s + txnARS(t), 0);
   const totalInstall  = installments.reduce((s,r) => s + (+r.installment_amount||0), 0);
   const saldo         = totalIncome - totalFixed - totalVariable - totalCards - totalInstall;
   const pctAhorro     = totalIncome > 0 ? (saldo / totalIncome * 100) : 0;
@@ -2971,7 +2982,7 @@ async function renderAnual() {
     const totalFixBudget  = fix.reduce((s,r)=>s+(+r.budgeted_amount||+r.amount||0),0);
     const totalVar        = vari.reduce((s,r)=>s+(+r.amount||0),0);
     const totalVarBudget  = vari.reduce((s,r)=>s+(+r.budgeted_amount||+r.amount||0),0);
-    const totalCrd  = txns.reduce((s,t)=>s+(t.currency==='USD'?(+t.converted_ars||0):(+t.amount_ars||0)),0);
+    const totalCrd  = txns.reduce((s,t)=>s+txnARS(t),0);
     const totalIns  = inst.reduce((s,r)=>s+(+r.installment_amount||0),0);
     const totalGasto = totalFix + totalVar + totalCrd + totalIns;
     const saldo     = totalInc - totalGasto;
@@ -3407,7 +3418,7 @@ async function generateMonthlyPDF() {
   const totalInc  = incomes.reduce((s,r)=>s+(+r.amount||0),0);
   const totalFix  = fixed.reduce((s,r)=>s+(+r.amount||0),0);
   const totalVar  = variable.reduce((s,r)=>s+(+r.amount||0),0);
-  const totalCrd  = allTxnsRaw.reduce((s,t)=>s+(t.currency==='USD'?(+t.converted_ars||0):(+t.amount_ars||0)),0);
+  const totalCrd  = allTxnsRaw.reduce((s,t)=>s+txnARS(t),0);
   const totalIns  = installments.reduce((s,r)=>s+(+r.installment_amount||0),0);
   const totalGasto= totalFix + totalVar + totalCrd + totalIns;
   const saldo     = totalInc - totalGasto;
@@ -3468,12 +3479,12 @@ async function generateMonthlyPDF() {
   // ── Sección Tarjetas ──
   const cardSections = cards.map(card => {
     const txns = txnsByCard[card.id] || [];
-    const cardTotal    = txns.reduce((s,t)=>s+(t.currency==='USD'?(+t.converted_ars||0):(+t.amount_ars||0)),0);
-    const cardPaid     = txns.filter(t=>t.status==='paid').reduce((s,t)=>s+(t.currency==='USD'?(+t.converted_ars||0):(+t.amount_ars||0)),0);
+    const cardTotal    = txns.reduce((s,t)=>s+txnARS(t),0);
+    const cardPaid     = txns.filter(t=>t.status==='paid').reduce((s,t)=>s+txnARS(t),0);
     const cardPending  = cardTotal - cardPaid;
 
     const txnRows = txns.length ? txns.map(t=>{
-      const amtARS = t.currency==='USD' ? (+t.converted_ars||0) : (+t.amount_ars||0);
+      const amtARS = txnARS(t);
       const cuotas = t.is_recurring ? 'Fijo' : t.total_installments>1 ? `${t.current_installment}/${t.total_installments}` : '1 pago';
       return `<tr>
         ${td(fd(t.transaction_date))} ${td(t.description)}
