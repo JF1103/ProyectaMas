@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <!-- cara superior: más iluminada -->
+  <path d="M16 3L28 9L16 16L4 9Z" fill="#4f79f7" fill-opacity="0.55"/>
+  <!-- cara derecha -->
+  <path d="M28 9L28 23L16 29L16 16Z" fill="#4f79f7" fill-opacity="0.30"/>
+  <!-- cara izquierda: más en sombra -->
+  <path d="M4 9L16 16L16 29L4 23Z" fill="#4f79f7" fill-opacity="0.15"/>
+  <!-- contorno hexagonal -->
+  <path d="M16 3L4 9V23L16 29L28 23V9L16 3Z" stroke="#4f79f7" stroke-width="1.75" stroke-linejoin="round"/>
+  <!-- líneas interiores (aristas del cubo) -->
+  <path d="M16 3V29M4 9L28 23M28 9L4 23" stroke="#4f79f7" stroke-width="1.2" opacity="0.55"/>
+</svg>
