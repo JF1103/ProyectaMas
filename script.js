@@ -1825,6 +1825,7 @@ async function showCardTransactions(cardId, txnsParam = null, cardsParam = null)
         <div style="display:flex;gap:.5rem;flex-wrap:wrap">
           <button class="btn btn--ghost btn--sm" onclick="editCard('${card.id}')">⚙ Configurar tarjeta</button>
           <button class="btn btn--ghost btn--sm" onclick="deleteCard('${card.id}','${card.name.replace(/'/g,"\\'")}')">🗑 Eliminar tarjeta</button>
+          ${totalUSD > 0 ? `<button class="btn btn--outline btn--sm" onclick="openApplyRateModal('${card.id}')">💱 Cotización USD</button>` : ''}
           <button class="btn btn--primary" onclick="openTxnForm('${card.id}')">+ Agregar consumo</button>
         </div>
       </div>
@@ -1857,6 +1858,67 @@ async function showCardTransactions(cardId, txnsParam = null, cardsParam = null)
         </table>
       </div>
     </div>`;
+}
+
+function openApplyRateModal(cardId) {
+  const txns = APP.cache.cardTxns[cardId] || [];
+  const usdTxns = txns.filter(t => t.currency === 'USD' && (+t.amount_usd||0) > 0);
+  if (usdTxns.length === 0) return toast('No hay consumos USD en este mes', 'info');
+  const suggestedRate = APP.dollarRate?.sell_rate ? APP.dollarRate.sell_rate.toFixed(2) : '';
+  const monthLabel = new Date(APP.currentYear, APP.currentMonth - 1).toLocaleString('es-AR', { month: 'long', year: 'numeric' });
+  openModal(`
+    <h2 class="modal-title">Aplicar cotización USD</h2>
+    <p style="font-size:.85rem;color:var(--text-2);margin-bottom:1rem">
+      Actualizará <strong>${usdTxns.length}</strong> consumo${usdTxns.length!==1?'s':''} USD de esta tarjeta en ${monthLabel}.
+    </p>
+    <div class="form-grid">
+      <div class="field-group">
+        <label class="field-label">Cotización a aplicar (ARS por USD) *</label>
+        <input id="apply-rate-val" type="number" class="field-input" placeholder="Ej: 1440" min="0" step="0.01" value="${suggestedRate}" oninput="previewApplyRate('${cardId}')">
+        <p style="font-size:.72rem;color:var(--text-3);margin-top:.25rem">Oficial hoy: ${APP.dollarRate?.sell_rate ? fmtARS(APP.dollarRate.sell_rate) : '—'}</p>
+      </div>
+      <div id="apply-rate-preview" style="font-size:.82rem;color:var(--text-2);padding:.5rem .75rem;background:var(--bg-3);border-radius:var(--radius-md);line-height:1.6">
+        Ingresá la cotización para ver el resumen
+      </div>
+      <div class="form-actions">
+        <button class="btn btn--ghost" onclick="closeModal()">Cancelar</button>
+        <button class="btn btn--primary" onclick="applyUSDRate('${cardId}')">Aplicar cotización</button>
+      </div>
+    </div>`);
+  if (suggestedRate) setTimeout(() => previewApplyRate(cardId), 50);
+}
+
+function previewApplyRate(cardId) {
+  const rate = parseFloat(document.getElementById('apply-rate-val')?.value || 0);
+  const preview = document.getElementById('apply-rate-preview');
+  if (!preview) return;
+  const txns = APP.cache.cardTxns[cardId] || [];
+  const usdTxns = txns.filter(t => t.currency === 'USD' && (+t.amount_usd||0) > 0);
+  if (!rate || rate <= 0) { preview.textContent = 'Ingresá la cotización para ver el resumen'; return; }
+  const totalUSD = usdTxns.reduce((s, t) => s + (+t.amount_usd||0), 0);
+  const rows = usdTxns.map(t => `· ${t.description}: ${fmtUSD(+t.amount_usd)} → ${fmtARS((+t.amount_usd) * rate)}`).join('<br>');
+  preview.innerHTML = `${rows}<br><strong style="display:block;margin-top:.4rem">Total ARS: ${fmtARS(totalUSD * rate)}</strong>`;
+}
+
+async function applyUSDRate(cardId) {
+  const rate = parseFloat(document.getElementById('apply-rate-val')?.value || 0);
+  if (!rate || rate <= 0) return toast('Ingresá una cotización válida', 'warning');
+  const txns = APP.cache.cardTxns[cardId] || [];
+  const usdTxns = txns.filter(t => t.currency === 'USD' && (+t.amount_usd||0) > 0);
+  if (usdTxns.length === 0) { closeModal(); return; }
+  const uniqueIds = [...new Set(usdTxns.map(t => t.id))];
+  let updated = 0;
+  for (const id of uniqueIds) {
+    const t = usdTxns.find(x => x.id === id);
+    const converted = (+t.amount_usd) * rate;
+    try {
+      await dbUpdate('card_transactions', id, { dollar_rate: rate, converted_ars: converted, amount_ars: converted });
+      updated++;
+    } catch(e) { console.error('applyUSDRate error', id, e); }
+  }
+  closeModal();
+  toast(`Cotización $${rate.toLocaleString('es-AR')} aplicada a ${updated} consumo${updated!==1?'s':''} USD`, 'success');
+  renderTarjetas();
 }
 
 function txnRow(t, cardId) {
@@ -1896,9 +1958,8 @@ function txnRow(t, cardId) {
 
 function openTxnForm(cardId, data = null) {
   const isEdit = !!data;
-  const impPct = getImpuestoPct();
   const dollarDefault = APP.dollarRate?.sell_rate
-    ? (APP.dollarRate.sell_rate * (1 + impPct / 100)).toFixed(2)
+    ? APP.dollarRate.sell_rate.toFixed(2)
     : '';
   const initConverted = data?.currency === 'USD' && (+data?.amount_usd||0) > 0 && (+data?.dollar_rate||0) > 0
     ? fmtARS((+data.amount_usd) * (+data.dollar_rate))
@@ -1944,6 +2005,7 @@ function openTxnForm(cardId, data = null) {
           <div class="field-group">
             <label class="field-label">Cotización ARS/USD</label>
             <input id="tx-rate" type="number" class="field-input" placeholder="0" min="0" step="0.01" value="${data?.dollar_rate||dollarDefault}" oninput="calcTxnConversion()">
+            <p style="font-size:.72rem;color:var(--text-3);margin-top:.25rem">Oficial hoy: ${APP.dollarRate?.sell_rate ? fmtARS(APP.dollarRate.sell_rate) : '—'} · Modificá según tu banco</p>
           </div>
         </div>
         <div class="field-group">
