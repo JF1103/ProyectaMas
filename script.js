@@ -385,18 +385,21 @@ async function computeExpenseMovementSummary(rows) {
   rows.forEach(r => {
     const budgetGross = getExpenseBudget(r);
     const s = map[r.id];
-    s.netBudget       = Math.max(0, budgetGross - s.reduction);
-    s.effectiveAmount = Math.max(s.netBudget, s.spentReal);
+    s.netBudget          = Math.max(0, budgetGross - s.reduction);
+    // effectiveAmount: para display de fila (resta sobre presupuesto neto)
+    s.effectiveAmount    = Math.max(s.netBudget, s.spentReal);
+    // effectiveForTotals: para Dashboard/Saldo/Ahorro/PDF — siempre reserva budgetGross completo
+    s.effectiveForTotals = Math.max(budgetGross, s.spentReal);
   });
   return map;
 }
 
-// Wrapper para compatibilidad — devuelve solo effectiveAmount por id.
-// Usado en Dashboard, Ahorro, Resumen Anual y PDF.
+// Wrapper para Dashboard, Ahorro, Resumen Anual y PDF.
+// Devuelve effectiveForTotals = max(budgetGross, spentReal) — los descuentos NO liberan saldo.
 async function computeRealAmounts(rows) {
   const summary = await computeExpenseMovementSummary(rows);
   const map = {};
-  Object.keys(summary).forEach(id => { map[id] = summary[id].effectiveAmount; });
+  Object.keys(summary).forEach(id => { map[id] = summary[id].effectiveForTotals; });
   return map;
 }
 
@@ -950,10 +953,10 @@ function getExpenseBudget(r) {
   return +r.budgeted_amount > 0 ? +r.budgeted_amount : (+r.amount || 0);
 }
 
-// effectiveAmount = max(netBudget, spentReal) — ya calculado por computeRealAmounts.
-// La reducción de presupuesto está baked-in; no se necesita re-aplicar el budgetGross aquí.
-function getExpenseEffectiveAmount(r, effectiveAmount) {
-  return effectiveAmount ?? 0;
+// effectiveForTotals = max(budgetGross, spentReal) — ya calculado por computeRealAmounts.
+// Los descuentos (subtract) NO reducen el monto que se descuenta del saldo disponible.
+function getExpenseEffectiveAmount(r, effectiveForTotals) {
+  return effectiveForTotals ?? 0;
 }
 
 async function renderDashboard() {
@@ -1283,7 +1286,7 @@ async function renderGastosFijos() {
   const totalBudgeted = rows.reduce((s,r) => s + getExpenseBudget(r), 0);
   const totalReal     = rows.reduce((s,r) => s + (summaryMap[r.id]?.spentReal ?? 0), 0);
   const totalNetBudget = rows.reduce((s,r) => s + (summaryMap[r.id]?.netBudget ?? getExpenseBudget(r)), 0);
-  const totalPaid     = rows.filter(r=>r.status==='paid').reduce((s,r)=>s+(summaryMap[r.id]?.effectiveAmount??0),0);
+  const totalPaid     = rows.filter(r=>r.status==='paid').reduce((s,r)=>s+(summaryMap[r.id]?.effectiveForTotals??0),0);
   const globalDiff    = totalNetBudget - totalReal;  // positivo = restante, negativo = excedido
   const pct           = totalBudgeted > 0 ? Math.min(100, totalReal / totalBudgeted * 100) : 0;
 
@@ -3833,8 +3836,8 @@ async function generateMonthlyPDF() {
   ]);
 
   const totalInc  = incomes.reduce((s,r)=>s+(+r.amount||0),0);
-  const totalFix  = fixed.reduce((s,r)=>s+getExpenseEffectiveAmount(r, fixSummaryPDF[r.id]?.effectiveAmount),0);
-  const totalVar  = variable.reduce((s,r)=>s+getExpenseEffectiveAmount(r, varSummaryPDF[r.id]?.effectiveAmount),0);
+  const totalFix  = fixed.reduce((s,r)=>s+getExpenseEffectiveAmount(r, fixSummaryPDF[r.id]?.effectiveForTotals),0);
+  const totalVar  = variable.reduce((s,r)=>s+getExpenseEffectiveAmount(r, varSummaryPDF[r.id]?.effectiveForTotals),0);
   const totalCrd  = allTxnsRaw.reduce((s,t)=>s+txnARS(t),0);
   const totalIns  = installments.reduce((s,r)=>s+(+r.installment_amount||0),0);
   const totalGasto= totalFix + totalVar + totalCrd + totalIns;
