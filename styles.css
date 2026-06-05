@@ -324,11 +324,42 @@ img, svg { display: block; }
   width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
   background: var(--text-3); transition: background 0.3s;
 }
-.sync-dot.sync--saving { background: var(--warning); animation: pulse 1s infinite; }
-.sync-dot.sync--saved  { background: var(--success); }
-.sync-dot.sync--error  { background: var(--danger); }
-.sync-dot.sync--offline { background: var(--text-3); }
+.sync-dot.sync--saving      { background: var(--warning); animation: pulse 1s infinite; }
+.sync-dot.sync--syncing     { background: var(--accent);  animation: pulse 0.6s infinite; }
+.sync-dot.sync--saved       { background: var(--success); }
+.sync-dot.sync--ready       { background: var(--success); }
+.sync-dot.sync--connecting  { background: var(--warning); animation: pulse 1.5s infinite; }
+.sync-dot.sync--reconnecting{ background: var(--warning); animation: pulse 0.8s infinite; }
+.sync-dot.sync--error       { background: var(--danger); }
+.sync-dot.sync--offline     { background: var(--text-3); }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* Badge de cambios pendientes */
+.pending-changes-badge {
+  position: fixed;
+  bottom: 5rem;
+  right: 1rem;
+  background: var(--accent);
+  color: #fff;
+  padding: .4rem .85rem;
+  border-radius: 2rem;
+  font-size: .78rem;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  z-index: 3000;
+  box-shadow: 0 4px 20px rgba(0,0,0,.3);
+  cursor: default;
+  animation: slideUpBadge .22s ease;
+}
+@keyframes slideUpBadge {
+  from { transform: translateY(10px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+@media (min-width: 769px) {
+  .pending-changes-badge { bottom: 2rem; right: 2rem; }
+}
 
 /* ---- WRAPPER PRINCIPAL ---- */
 .main-wrapper {

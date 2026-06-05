@@ -94,7 +94,12 @@ async function login(email, password) {
 
 async function logout() {
   confirmAction('¿Cerrar sesión?', async () => {
+    stopPolling();
+    clearTimeout(_rtRefreshTimer);
     unsubscribeRealtime();
+    _pendingRefresh = false;
+    const badge = document.getElementById('pending-changes-badge');
+    if (badge) badge.style.display = 'none';
     await APP.supabase.auth.signOut();
     APP.session = null; APP.profile = null; APP.householdId = null;
     Object.keys(APP.cache).forEach(k => { APP.cache[k] = Array.isArray(APP.cache[k]) ? [] : (typeof APP.cache[k] === 'object' && APP.cache[k] !== null ? {} : null); });
@@ -165,6 +170,7 @@ async function showApp() {
   updateUserUI();
   await loadCurrentSection();
   subscribeRealtime();
+  startPolling();
 }
 
 function updateUserUI() {
@@ -498,44 +504,149 @@ async function deleteMovement(movId, expenseId, expenseType, movAmount, movType,
 /* ============================================================
    10. REALTIME – SINCRONIZACIÓN
    ============================================================ */
+let _rtRefreshTimer   = null;   // debounce timer para refresh remoto
+let _isRefreshing     = false;  // guard para evitar refreshes paralelos
+let _pendingRefresh   = false;  // hay cambios remotos esperando (modal abierto)
+let _pollInterval     = null;   // fallback polling cada 30s
+let _reconnectTimer   = null;   // timer de reconexión realtime
+
+// Comprueba si hay algún modal/overlay visible en pantalla
+function isModalOpen() {
+  const o = document.getElementById('modal-overlay');
+  const c = document.getElementById('confirm-overlay');
+  return (o && !o.classList.contains('hidden')) || (c && !c.classList.contains('hidden'));
+}
+
+// Programa un refresh con debounce de 600ms para colapsar ráfagas de eventos
+function scheduleRealtimeRefresh(reason) {
+  clearTimeout(_rtRefreshTimer);
+  _rtRefreshTimer = setTimeout(() => refreshCurrentViewFromRemote(reason), 600);
+}
+
+// Recarga la vista actual desde remoto de forma segura
+async function refreshCurrentViewFromRemote(reason) {
+  if (_isRefreshing) return;
+
+  if (isModalOpen()) {
+    // El usuario está en un formulario: acumular y avisar
+    _pendingRefresh = true;
+    const badge = document.getElementById('pending-changes-badge');
+    if (badge) badge.style.display = 'flex';
+    return;
+  }
+
+  _pendingRefresh = false;
+  const badge = document.getElementById('pending-changes-badge');
+  if (badge) badge.style.display = 'none';
+
+  _isRefreshing = true;
+  setSyncStatus('syncing');
+  try {
+    await loadCurrentSection();
+    setSyncStatus('saved');
+  } catch(e) {
+    console.warn('[RT] refresh error:', e);
+    setSyncStatus('error');
+    setTimeout(() => setSyncStatus('ready'), 3000);
+  } finally {
+    _isRefreshing = false;
+  }
+}
+
 function subscribeRealtime() {
   if (!APP.householdId) return;
   unsubscribeRealtime();
+  clearTimeout(_reconnectTimer);
+  setSyncStatus('connecting');
 
-  const tables = [
+  // Tablas con household_id (datos del hogar)
+  const householdTables = [
     'incomes', 'fixed_expenses', 'variable_expenses',
-    'card_transactions', 'card_transaction_monthly_status',
-    'independent_installments', 'expense_movements'
+    'credit_cards', 'card_summaries', 'card_transactions',
+    'card_transaction_monthly_status', 'independent_installments',
+    'saving_goals', 'expense_movements', 'imports_log'
   ];
-  tables.forEach(t => {
-    const ch = APP.supabase.channel(`rt-${t}`)
-      .on('postgres_changes', {
-        event: '*', schema: 'public', table: t,
-        filter: `household_id=eq.${APP.householdId}`
-      }, () => {
-        setSyncStatus('saved');
-        loadCurrentSection();
-      })
-      .subscribe();
-    APP.syncChannels.push(ch);
+
+  let firstConnected = false;
+  householdTables.forEach(table => {
+    try {
+      const ch = APP.supabase
+        .channel(`rt-${table}-${APP.householdId}`)
+        .on('postgres_changes', {
+          event: '*', schema: 'public', table,
+          filter: `household_id=eq.${APP.householdId}`
+        }, () => scheduleRealtimeRefresh(table))
+        .subscribe((status, err) => {
+          if (status === 'SUBSCRIBED' && !firstConnected) {
+            firstConnected = true;
+            setSyncStatus('ready');
+          }
+          if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+            setSyncStatus('reconnecting');
+            clearTimeout(_reconnectTimer);
+            _reconnectTimer = setTimeout(() => {
+              if (APP.householdId) subscribeRealtime();
+            }, 6000);
+          }
+        });
+      APP.syncChannels.push(ch);
+    } catch(e) { console.warn('[RT] subscribe error for', table, e); }
   });
+
+  // dollar_rates: tabla global sin household_id
+  try {
+    const chDolar = APP.supabase
+      .channel('rt-dollar_rates-global')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'dollar_rates' },
+        () => scheduleRealtimeRefresh('dollar_rates'))
+      .subscribe();
+    APP.syncChannels.push(chDolar);
+  } catch(e) { console.warn('[RT] dollar_rates subscribe error', e); }
 }
 
 function unsubscribeRealtime() {
-  APP.syncChannels.forEach(ch => APP.supabase.removeChannel(ch));
+  clearTimeout(_reconnectTimer);
+  APP.syncChannels.forEach(ch => {
+    try { APP.supabase.removeChannel(ch); } catch {}
+  });
   APP.syncChannels = [];
 }
 
+// Polling de respaldo cada 30s (por si Realtime falla o el WS se desconecta)
+function startPolling() {
+  stopPolling();
+  _pollInterval = setInterval(async () => {
+    if (!APP.session || !APP.householdId) return;
+    if (isModalOpen() || _isRefreshing) return;
+    _isRefreshing = true;
+    try { await loadCurrentSection(); }
+    catch(e) { console.warn('[Poll]', e); }
+    finally { _isRefreshing = false; }
+  }, 30000);
+}
+
+function stopPolling() {
+  if (_pollInterval) { clearInterval(_pollInterval); _pollInterval = null; }
+}
+
+let _savedResetTimer = null;
 function setSyncStatus(status) {
-  const dots = document.querySelectorAll('.sync-dot');
+  const dots  = document.querySelectorAll('.sync-dot');
   const texts = document.querySelectorAll('.sync-text');
-  const labels = { saving:'Guardando…', saved:'Guardado', error:'Error', offline:'Sin conexión' };
-  dots.forEach(d => {
-    d.className = 'sync-dot';
-    d.classList.add(`sync--${status}`);
-  });
-  texts.forEach(t => { t.textContent = labels[status] || 'Listo'; });
-  if (status === 'saved') setTimeout(() => setSyncStatus('ready'), 2500);
+  const labels = {
+    saving:       'Guardando…',
+    saved:        'Guardado',
+    syncing:      'Sincronizando…',
+    ready:        'Listo',
+    connecting:   'Conectando…',
+    reconnecting: 'Reconectando…',
+    error:        'Error',
+    offline:      'Sin conexión',
+  };
+  dots.forEach(d => { d.className = 'sync-dot'; d.classList.add(`sync--${status}`); });
+  texts.forEach(t => { t.textContent = labels[status] ?? status; });
+  clearTimeout(_savedResetTimer);
+  if (status === 'saved') _savedResetTimer = setTimeout(() => setSyncStatus('ready'), 2500);
 }
 
 /* ============================================================
@@ -682,6 +793,13 @@ function closeModal() {
   hideEl('modal-overlay');
   document.body.style.overflow = '';
   $('modal-body').innerHTML = '';
+  // Si hubo cambios remotos mientras el modal estaba abierto, refrescar ahora
+  if (_pendingRefresh) {
+    _pendingRefresh = false;
+    const badge = document.getElementById('pending-changes-badge');
+    if (badge) badge.style.display = 'none';
+    refreshCurrentViewFromRemote('post-modal');
+  }
 }
 
 /* ============================================================
@@ -767,7 +885,7 @@ function bindGlobalEvents() {
 
   // Offline/Online
   window.addEventListener('offline', () => setSyncStatus('offline'));
-  window.addEventListener('online',  () => { setSyncStatus('saved'); subscribeRealtime(); });
+  window.addEventListener('online',  () => { setSyncStatus('connecting'); subscribeRealtime(); startPolling(); });
 }
 
 function openMobileSidebar() {
