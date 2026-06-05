@@ -931,6 +931,19 @@ function closeMobileSidebar() {
 /* ============================================================
    16. DASHBOARD
    ============================================================ */
+
+// Devuelve el presupuesto de un gasto fijo/variable.
+// Usa budgeted_amount si > 0; si no, cae al amount legacy (filas viejas).
+function getExpenseBudget(r) {
+  return +r.budgeted_amount > 0 ? +r.budgeted_amount : (+r.amount || 0);
+}
+
+// Monto efectivo a descontar del saldo = max(presupuesto, real acumulado).
+// Así el presupuesto reserva fondos aunque no haya movimientos todavía.
+function getExpenseEffectiveAmount(r, realAmount) {
+  return Math.max(getExpenseBudget(r), realAmount ?? 0);
+}
+
 async function renderDashboard() {
   const sec = $('section-dashboard');
   sec.innerHTML = `<div style="display:flex;align-items:center;gap:.5rem;color:var(--text-3);padding:2rem"><span class="spinner"></span> Cargando...</div>`;
@@ -944,15 +957,21 @@ async function renderDashboard() {
     dbSelect('independent_installments', { status: 'active' })
   ]);
 
+  // Cargar movimientos reales para calcular effective = max(presupuesto, real)
+  const [fixedReal, varReal] = await Promise.all([
+    computeRealAmounts(fixed),
+    computeRealAmounts(variable)
+  ]);
+
   const totalIncome        = incomes.reduce((s,r) => s + (+r.amount||0), 0);
-  // Real = amount (mantenido en sincronía con movimientos); budget = budgeted_amount
-  const totalFixed         = fixed.reduce((s,r) => s + (+r.amount||0), 0);
-  const totalFixedBudgeted = fixed.reduce((s,r) => s + (r.budgeted_amount != null ? +r.budgeted_amount : +r.amount||0), 0);
-  const totalVariable      = variable.reduce((s,r) => s + (+r.amount||0), 0);
-  const totalVarBudgeted   = variable.reduce((s,r) => s + (r.budgeted_amount != null ? +r.budgeted_amount : +r.amount||0), 0);
+  const totalFixed         = fixed.reduce((s,r) => s + getExpenseEffectiveAmount(r, fixedReal[r.id]), 0);
+  const totalFixedBudgeted = fixed.reduce((s,r) => s + getExpenseBudget(r), 0);
+  const totalVariable      = variable.reduce((s,r) => s + getExpenseEffectiveAmount(r, varReal[r.id]), 0);
+  const totalVarBudgeted   = variable.reduce((s,r) => s + getExpenseBudget(r), 0);
   const totalCards    = allTxns.reduce((s,r) => s + txnARS(r), 0);
   const totalInstall  = installments.reduce((s,r) => s + (+r.installment_amount||0), 0);
-  const totalPaid     = fixed.filter(r=>r.status==='paid').reduce((s,r)=>s+(+r.amount||0),0)
+  const totalPaid     = fixed.filter(r=>r.status==='paid')
+                             .reduce((s,r) => s + getExpenseEffectiveAmount(r, fixedReal[r.id]), 0)
                       + allTxns.filter(r=>r.status==='paid').reduce((s,r)=>s+txnARS(r),0);
   const totalPending  = totalFixed + totalVariable + totalCards + totalInstall - totalPaid;
   const saldo         = totalIncome - totalFixed - totalVariable - totalCards - totalInstall;
@@ -2896,9 +2915,15 @@ async function renderAhorro() {
   const goal = goalData[0] || null;
   APP.cache.savingGoal = goal;
 
+  // Movimientos reales para effective = max(presupuesto, real)
+  const [fixedRealA, varRealA] = await Promise.all([
+    computeRealAmounts(fixed),
+    computeRealAmounts(variable)
+  ]);
+
   const totalIncome   = incomes.reduce((s,r) => s + (+r.amount||0), 0);
-  const totalFixed    = fixed.reduce((s,r) => s + (+r.amount||0), 0);
-  const totalVariable = variable.reduce((s,r) => s + (+r.amount||0), 0);
+  const totalFixed    = fixed.reduce((s,r) => s + getExpenseEffectiveAmount(r, fixedRealA[r.id]), 0);
+  const totalVariable = variable.reduce((s,r) => s + getExpenseEffectiveAmount(r, varRealA[r.id]), 0);
   const totalCards    = allTxns.reduce((s,t) => s + txnARS(t), 0);
   const totalInstall  = installments.reduce((s,r) => s + (+r.installment_amount||0), 0);
   const saldo         = totalIncome - totalFixed - totalVariable - totalCards - totalInstall;
@@ -2909,7 +2934,7 @@ async function renderAhorro() {
   const difMeta        = saldo - metaMensual;
   const dollarRate     = APP.dollarRate?.sell_rate || 0;
 
-  // Escenarios
+  // Escenarios (variables se pueden reducir; fijos son compromisos fijos)
   const esc10   = totalIncome - totalFixed - (totalVariable * 0.9) - totalCards - totalInstall;
   const esc20   = totalIncome - totalFixed - (totalVariable * 0.8) - totalCards - totalInstall;
   const esc30   = totalIncome - totalFixed - (totalVariable * 0.7) - totalCards - totalInstall;
@@ -3339,11 +3364,15 @@ async function renderAnual() {
       loadCardTxnsForMonth(m, year),
       dbSelect('independent_installments', { status: 'active' })
     ]);
+    const [fixRealM, varRealM] = await Promise.all([
+      computeRealAmounts(fix),
+      computeRealAmounts(vari)
+    ]);
     const totalInc        = inc.reduce((s,r)=>s+(+r.amount||0),0);
-    const totalFix        = fix.reduce((s,r)=>s+(+r.amount||0),0);
-    const totalFixBudget  = fix.reduce((s,r)=>s+(+r.budgeted_amount||+r.amount||0),0);
-    const totalVar        = vari.reduce((s,r)=>s+(+r.amount||0),0);
-    const totalVarBudget  = vari.reduce((s,r)=>s+(+r.budgeted_amount||+r.amount||0),0);
+    const totalFixBudget  = fix.reduce((s,r)=>s+getExpenseBudget(r),0);
+    const totalFix        = fix.reduce((s,r)=>s+getExpenseEffectiveAmount(r, fixRealM[r.id]),0);
+    const totalVarBudget  = vari.reduce((s,r)=>s+getExpenseBudget(r),0);
+    const totalVar        = vari.reduce((s,r)=>s+getExpenseEffectiveAmount(r, varRealM[r.id]),0);
     const totalCrd  = txns.reduce((s,t)=>s+txnARS(t),0);
     const totalIns  = inst.reduce((s,r)=>s+(+r.installment_amount||0),0);
     const totalGasto = totalFix + totalVar + totalCrd + totalIns;
@@ -3777,9 +3806,15 @@ async function generateMonthlyPDF() {
   const pu = n => new Intl.NumberFormat('es-AR',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:2}).format(n||0);
   const fd = d => d ? new Date(d+'T00:00:00').toLocaleDateString('es-AR') : '—';
 
+  // Movimientos reales para effective = max(presupuesto, real)
+  const [fixRealPDF, varRealPDF] = await Promise.all([
+    computeRealAmounts(fixed),
+    computeRealAmounts(variable)
+  ]);
+
   const totalInc  = incomes.reduce((s,r)=>s+(+r.amount||0),0);
-  const totalFix  = fixed.reduce((s,r)=>s+(+r.amount||0),0);
-  const totalVar  = variable.reduce((s,r)=>s+(+r.amount||0),0);
+  const totalFix  = fixed.reduce((s,r)=>s+getExpenseEffectiveAmount(r, fixRealPDF[r.id]),0);
+  const totalVar  = variable.reduce((s,r)=>s+getExpenseEffectiveAmount(r, varRealPDF[r.id]),0);
   const totalCrd  = allTxnsRaw.reduce((s,t)=>s+txnARS(t),0);
   const totalIns  = installments.reduce((s,r)=>s+(+r.installment_amount||0),0);
   const totalGasto= totalFix + totalVar + totalCrd + totalIns;
@@ -3807,32 +3842,32 @@ async function generateMonthlyPDF() {
   </tr>`).join('') : noData('ingresos');
 
   // ── Sección Gastos Fijos ──
-  const totalFixBudgetedPDF = fixed.reduce((s,r)=>s+(+r.budgeted_amount||+r.amount||0),0);
+  const totalFixBudgetedPDF = fixed.reduce((s,r)=>s+getExpenseBudget(r),0);
   const fixRows = fixed.length ? fixed.map(r=>{
-    const budg = +r.budgeted_amount||+r.amount||0;
-    const real = +r.amount||0;
+    const budg = getExpenseBudget(r);
+    const real = fixRealPDF[r.id] ?? 0;
     const diff = real - budg;
     return `<tr>
       ${td(r.description)} ${td(r.category||'General')} ${td(r.person||'—')} ${td(fd(r.due_date))}
       <td style="text-align:center"><span class="badge-pdf ${r.status==='paid'?'badge-ok':'badge-pend'}">${r.status==='paid'?'Pagado':'Pendiente'}</span></td>
       ${td(p(budg),true,false,'#475569')}
-      ${td(p(real),true,true,diff>0?'#dc2626':diff<0?'#16a34a':'#dc2626')}
+      ${td(p(real),true,true,diff>0?'#dc2626':diff<0?'#16a34a':'#475569')}
       ${td(diff===0?'—':(diff>0?'+':'')+p(diff),true,false,diff>0?'#dc2626':diff<0?'#16a34a':'#94a3b8')}
       ${td(r.notes||'')}
     </tr>`;
   }).join('') : noData('gastos fijos');
 
   // ── Sección Gastos Variables ──
-  const totalVarBudgetedPDF = variable.reduce((s,r)=>s+(+r.budgeted_amount||+r.amount||0),0);
+  const totalVarBudgetedPDF = variable.reduce((s,r)=>s+getExpenseBudget(r),0);
   const varRows = variable.length ? variable.map(r=>{
-    const budg = +r.budgeted_amount||+r.amount||0;
-    const real = +r.amount||0;
+    const budg = getExpenseBudget(r);
+    const real = varRealPDF[r.id] ?? 0;
     const diff = real - budg;
     return `<tr>
       ${td(r.description)} ${td(r.category||'Otros')} ${td(r.person||'—')} ${td(r.payment_method||'—')}
       ${td(fd(r.expense_date))}
       ${td(p(budg),true,false,'#475569')}
-      ${td(p(real),true,true,diff>0?'#dc2626':diff<0?'#16a34a':'#dc2626')}
+      ${td(p(real),true,true,diff>0?'#dc2626':diff<0?'#16a34a':'#475569')}
       ${td(diff===0?'—':(diff>0?'+':'')+p(diff),true,false,diff>0?'#dc2626':diff<0?'#16a34a':'#94a3b8')}
       ${td(r.notes||'')}
     </tr>`;
