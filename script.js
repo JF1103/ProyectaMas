@@ -361,6 +361,35 @@ async function upsertMonthlyStatus(transactionId, month, year, status) {
 /* ============================================================
    9b. MOVIMIENTOS DE GASTOS (expense_movements)
    ============================================================ */
+
+// Calcula el gasto real de cada fila a partir de expense_movements (fuente de verdad).
+// Filas sin budgeted_amount (estilo antiguo): usa amount directamente como real.
+async function computeRealAmounts(rows) {
+  const withBudget = rows.filter(r => r.budgeted_amount != null);
+  const realMap = {};
+
+  // Antiguo estilo (sin presupuesto separado): amount == real
+  rows.filter(r => r.budgeted_amount == null)
+      .forEach(r => { realMap[r.id] = Math.max(0, +r.amount || 0); });
+
+  if (!withBudget.length) return realMap;
+
+  const ids = withBudget.map(r => r.id);
+  const { data: movs } = await APP.supabase
+    .from('expense_movements')
+    .select('expense_id, movement_type, amount')
+    .eq('household_id', APP.householdId)
+    .in('expense_id', ids);
+
+  withBudget.forEach(r => { realMap[r.id] = 0; });
+  (movs || []).forEach(m => {
+    if (realMap[m.expense_id] !== undefined)
+      realMap[m.expense_id] += m.movement_type === 'add' ? +m.amount : -(+m.amount);
+  });
+  withBudget.forEach(r => { realMap[r.id] = Math.max(0, realMap[r.id]); });
+  return realMap;
+}
+
 function openMovementForm(expenseId, expenseType, expenseDesc) {
   const safeDesc = expenseDesc.replace(/`/g, "'");
   openModal(`
@@ -408,27 +437,31 @@ async function saveMovement(expenseId, expenseType) {
   const desc    = $('mov-desc').value.trim();
   const notes   = $('mov-notes').value.trim();
 
-  if (!desc)                         return toast('Ingresá una descripción', 'warning');
-  if (isNaN(amount) || amount <= 0)  return toast('Monto inválido', 'warning');
+  if (!desc)                        return toast('Ingresá una descripción', 'warning');
+  if (isNaN(amount) || amount <= 0) return toast('Monto inválido', 'warning');
+
+  // Calcular el real actual sumando movimientos existentes (fuente de verdad)
+  const { data: existingMovs } = await APP.supabase
+    .from('expense_movements')
+    .select('movement_type, amount')
+    .eq('household_id', APP.householdId)
+    .eq('expense_id', expenseId);
+
+  const currentReal = (existingMovs || []).reduce((s, m) =>
+    s + (m.movement_type === 'add' ? +m.amount : -(+m.amount)), 0);
+  const newReal = currentReal + (movType === 'add' ? amount : -amount);
+
+  if (newReal < 0) return toast(`El monto resultante sería negativo (quedaría ${fmtARS(newReal)}). Revisá el valor.`, 'warning');
 
   const table = expenseType === 'fixed' ? 'fixed_expenses' : 'variable_expenses';
-
-  setSyncStatus('saving');
-  const { data: expense, error: fetchErr } = await APP.supabase
-    .from(table).select('amount').eq('id', expenseId).single();
-  if (fetchErr || !expense) { setSyncStatus('error'); return toast('Error al obtener el gasto', 'error'); }
-
-  const currentAmount = +expense.amount || 0;
-  const newAmount = movType === 'add' ? currentAmount + amount : currentAmount - amount;
-  if (newAmount < 0) return toast(`El monto resultante sería negativo (quedaría ${fmtARS(newAmount)}). Revisá el valor.`, 'warning');
-
   try {
     await dbInsert('expense_movements', {
       expense_type: expenseType, expense_id: expenseId,
       movement_type: movType, amount,
       date: date || null, description: desc, notes: notes || null
     });
-    await dbUpdate(table, expenseId, { amount: newAmount });
+    // Sincronizar amount con el real calculado desde movimientos
+    await dbUpdate(table, expenseId, { amount: Math.max(0, newReal) });
     closeModal();
     toast('Movimiento agregado ✓');
     if (expenseType === 'fixed') renderGastosFijos();
@@ -476,23 +509,23 @@ async function viewMovements(expenseId, expenseType, expenseDesc) {
 }
 
 async function deleteMovement(movId, expenseId, expenseType, movAmount, movType, expenseDesc) {
-  confirmAction('¿Eliminar este movimiento? El monto del gasto se revertirá.', async () => {
+  confirmAction('¿Eliminar este movimiento? El gasto real se actualizará automáticamente.', async () => {
     const table = expenseType === 'fixed' ? 'fixed_expenses' : 'variable_expenses';
 
-    setSyncStatus('saving');
-    const { data: expense, error: fetchErr } = await APP.supabase
-      .from(table).select('amount').eq('id', expenseId).single();
-    if (fetchErr || !expense) { setSyncStatus('error'); return toast('Error al obtener el gasto', 'error'); }
+    // Obtener todos los movimientos para calcular el real luego del borrado
+    const { data: allMovs } = await APP.supabase
+      .from('expense_movements')
+      .select('id, movement_type, amount')
+      .eq('household_id', APP.householdId)
+      .eq('expense_id', expenseId);
 
-    const currentAmount = +expense.amount || 0;
-    const revertedAmount = movType === 'add'
-      ? currentAmount - movAmount
-      : currentAmount + movAmount;
-    const finalAmount = Math.max(0, revertedAmount);
+    const newReal = Math.max(0, (allMovs || [])
+      .filter(m => m.id !== movId)
+      .reduce((s, m) => s + (m.movement_type === 'add' ? +m.amount : -(+m.amount)), 0));
 
     try {
       await dbDelete('expense_movements', movId);
-      await dbUpdate(table, expenseId, { amount: finalAmount });
+      await dbUpdate(table, expenseId, { amount: newReal });
       toast('Movimiento eliminado');
       if (expenseType === 'fixed') renderGastosFijos();
       else renderGastosVariables();
@@ -915,18 +948,19 @@ async function renderDashboard() {
     dbSelect('independent_installments', { status: 'active' })
   ]);
 
-  const totalIncome         = incomes.reduce((s,r) => s + (+r.amount||0), 0);
-  const totalFixed          = fixed.reduce((s,r) => s + (+r.amount||0), 0);
-  const totalFixedBudgeted  = fixed.reduce((s,r) => s + (+r.budgeted_amount || +r.amount||0), 0);
-  const totalVariable       = variable.reduce((s,r) => s + (+r.amount||0), 0);
-  const totalVarBudgeted    = variable.reduce((s,r) => s + (+r.budgeted_amount || +r.amount||0), 0);
-  const totalCards     = allTxns.reduce((s,r) => s + txnARS(r), 0);
-  const totalInstall   = installments.reduce((s,r) => s + (+r.installment_amount||0), 0);
-  const totalPaid      = fixed.filter(r=>r.status==='paid').reduce((s,r)=>s+(+r.amount||0),0)
-                       + allTxns.filter(r=>r.status==='paid').reduce((s,r)=>s+txnARS(r),0);
-  const totalPending   = totalFixed + totalVariable + totalCards + totalInstall - totalPaid;
-  const saldo          = totalIncome - totalFixed - totalVariable - totalCards - totalInstall;
-  const pctGastado     = totalIncome > 0 ? Math.min(100, ((totalFixed+totalVariable+totalCards+totalInstall)/totalIncome)*100) : 0;
+  const totalIncome        = incomes.reduce((s,r) => s + (+r.amount||0), 0);
+  // Real = amount (mantenido en sincronía con movimientos); budget = budgeted_amount
+  const totalFixed         = fixed.reduce((s,r) => s + (+r.amount||0), 0);
+  const totalFixedBudgeted = fixed.reduce((s,r) => s + (r.budgeted_amount != null ? +r.budgeted_amount : +r.amount||0), 0);
+  const totalVariable      = variable.reduce((s,r) => s + (+r.amount||0), 0);
+  const totalVarBudgeted   = variable.reduce((s,r) => s + (r.budgeted_amount != null ? +r.budgeted_amount : +r.amount||0), 0);
+  const totalCards    = allTxns.reduce((s,r) => s + txnARS(r), 0);
+  const totalInstall  = installments.reduce((s,r) => s + (+r.installment_amount||0), 0);
+  const totalPaid     = fixed.filter(r=>r.status==='paid').reduce((s,r)=>s+(+r.amount||0),0)
+                      + allTxns.filter(r=>r.status==='paid').reduce((s,r)=>s+txnARS(r),0);
+  const totalPending  = totalFixed + totalVariable + totalCards + totalInstall - totalPaid;
+  const saldo         = totalIncome - totalFixed - totalVariable - totalCards - totalInstall;
+  const pctGastado    = totalIncome > 0 ? Math.min(100, ((totalFixed+totalVariable+totalCards+totalInstall)/totalIncome)*100) : 0;
 
   const dollarRate     = APP.dollarRate?.sell_rate || 0;
   const dolaresAhorro  = dollarRate > 0 && saldo > 0 ? (saldo / dollarRate).toFixed(1) : '—';
@@ -1217,12 +1251,13 @@ async function renderGastosFijos() {
   const rows = await dbSelect('fixed_expenses', { month: APP.currentMonth, year: APP.currentYear });
   APP.cache.fixedExpenses = rows;
 
-  const total          = rows.reduce((s,r) => s + (+r.amount||0), 0);
-  const totalBudgeted  = rows.reduce((s,r) => s + (+r.budgeted_amount || +r.amount||0), 0);
-  const totalPaid      = rows.filter(r=>r.status==='paid').reduce((s,r)=>s+(+r.amount||0),0);
-  const totalPend      = total - totalPaid;
-  const totalDiff      = total - totalBudgeted;
-  const pct = total > 0 ? (totalPaid/total*100) : 0;
+  // Real = suma de movimientos (fuente de verdad); presupuesto = budgeted_amount
+  const realMap       = await computeRealAmounts(rows);
+  const totalBudgeted = rows.reduce((s,r) => s + (r.budgeted_amount != null ? +r.budgeted_amount : +r.amount || 0), 0);
+  const totalReal     = rows.reduce((s,r) => s + (realMap[r.id] ?? 0), 0);
+  const totalPaid     = rows.filter(r=>r.status==='paid').reduce((s,r)=>s+(realMap[r.id]??0),0);
+  const globalDiff    = totalBudgeted - totalReal;   // positivo = restante, negativo = excedido
+  const pct           = totalBudgeted > 0 ? Math.min(100, totalReal / totalBudgeted * 100) : 0;
 
   sec.innerHTML = `
     <div class="section-top">
@@ -1230,8 +1265,10 @@ async function renderGastosFijos() {
         <h2 class="section-title">Gastos Fijos</h2>
         <p class="section-subtitle">
           Presupuesto: <strong class="mono">${fmtARS(totalBudgeted)}</strong>
-          · Real: <strong class="mono" style="color:${totalDiff>0?'var(--danger)':totalDiff<0?'var(--success)':'inherit'}">${fmtARS(total)}</strong>
-          ${totalDiff!==0?`· <span style="color:${totalDiff>0?'var(--danger)':'var(--success)'}">${totalDiff>0?'↑':'↓'} ${fmtARS(Math.abs(totalDiff))}</span>`:''}
+          · Real: <strong class="mono" style="color:${globalDiff<-0.01?'var(--danger)':'inherit'}">${fmtARS(totalReal)}</strong>
+          ${Math.abs(globalDiff)>0.01
+            ?`· <span style="color:${globalDiff>0?'var(--success)':'var(--danger)'}">${globalDiff>0?'↓ Resta':'↑ Excede'} ${fmtARS(Math.abs(globalDiff))}</span>`
+            :''}
           · Pagado: <span style="color:var(--success)">${fmtARS(totalPaid)}</span>
         </p>
       </div>
@@ -1243,9 +1280,9 @@ async function renderGastosFijos() {
     </div>
 
     <div class="progress-bar" style="margin-bottom:1rem">
-      <div class="progress-fill ${pct<50?'progress-fill--danger':pct<80?'progress-fill--warning':'progress-fill--success'}" style="width:${pct}%"></div>
+      <div class="progress-fill ${pct>=100?'progress-fill--danger':pct>80?'progress-fill--warning':'progress-fill--success'}" style="width:${Math.min(100,pct)}%"></div>
     </div>
-    <p style="font-size:.75rem;color:var(--text-3);margin-bottom:1rem">${pct.toFixed(0)}% pagado del total</p>
+    <p style="font-size:.75rem;color:var(--text-3);margin-bottom:1rem">${pct.toFixed(0)}% del presupuesto utilizado</p>
 
     <div class="filter-bar">
       <div class="search-input-wrap">
@@ -1275,23 +1312,35 @@ async function renderGastosFijos() {
         <tbody id="fixed-tbody">
           ${rows.length === 0
             ? `<tr><td colspan="8"><div class="table-empty">Sin gastos fijos este mes. <button class="btn btn--ghost btn--sm" onclick="precargarGastosFijos()">Precargar lista</button></div></td></tr>`
-            : rows.map(r => fixedRow(r)).join('')}
+            : rows.map(r => fixedRow(r, realMap[r.id] ?? 0)).join('')}
         </tbody>
       </table>
     </div>`;
 }
 
-function fixedRow(r) {
-  const budgeted  = +r.budgeted_amount || +r.amount || 0;
-  const real      = +r.amount || 0;
-  const diff      = real - budgeted;
-  const hasDiff   = budgeted > 0 && Math.abs(diff) >= 0.01;
-  const diffColor = diff > 0 ? 'var(--danger)' : 'var(--success)';
+function fixedRow(r, realAmount) {
+  const hasBudget = r.budgeted_amount != null;
+  const budget    = hasBudget ? +r.budgeted_amount : +r.amount || 0;
+  const real      = hasBudget ? realAmount : +r.amount || 0;
 
-  const budgetInfo = hasDiff
-    ? `<br><span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budgeted)}</span>
-       <span style="font-size:.7rem;margin-left:.35rem;color:${diffColor}">${diff>0?'↑':'↓'} ${fmtARS(Math.abs(diff))}</span>`
-    : '';
+  let amountCell;
+  if (!hasBudget) {
+    amountCell = `<strong>${fmtARS(real)}</strong>`;
+  } else {
+    const diff = budget - real;   // positivo = restante, negativo = excedido
+    let subLine;
+    if (Math.abs(diff) < 0.01) {
+      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)} · ✓ 100%</span>`;
+    } else if (diff > 0) {
+      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)}</span>
+        <span style="font-size:.7rem;margin-left:.3rem;color:var(--success)">↓ Resta ${fmtARS(diff)}</span>`;
+    } else {
+      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)}</span>
+        <span style="font-size:.7rem;margin-left:.3rem;color:var(--danger)">↑ Excede ${fmtARS(-diff)}</span>`;
+    }
+    amountCell = `<strong style="color:${diff<-0.01?'var(--danger)':'inherit'}">${fmtARS(real)}</strong>
+      <br>${subLine}`;
+  }
 
   const statusBadge = r.status === 'paid'
     ? '<span class="badge badge--success">Pagado</span>'
@@ -1303,10 +1352,7 @@ function fixedRow(r) {
     <td>${categoryBadge(r.category||'General')}</td>
     <td style="font-size:.8rem">${r.person||'—'}</td>
     <td style="font-size:.8rem">${r.due_date?fmtDate(r.due_date):'—'}</td>
-    <td style="text-align:right" class="mono">
-      <strong style="color:${hasDiff?(diff>0?'var(--danger)':'var(--success)'):'inherit'}">${fmtARS(real)}</strong>
-      ${budgetInfo}
-    </td>
+    <td style="text-align:right" class="mono">${amountCell}</td>
     <td>${statusBadge}</td>
     <td>
       <div class="table-actions">
@@ -1458,7 +1504,7 @@ async function saveFixed() {
   if (isNaN(budget) || budget < 0) return toast('Monto inválido', 'warning');
   try {
     await dbInsert('fixed_expenses', {
-      description: desc, amount: budget, budgeted_amount: budget,
+      description: desc, amount: 0, budgeted_amount: budget,
       category: $('fx-cat').value, person: $('fx-person').value,
       status: $('fx-status').value, due_date: $('fx-due').value || null,
       notes: $('fx-notes').value.trim() || null,
@@ -1550,9 +1596,9 @@ async function duplicarMesAnterior(table) {
     for (const row of prev) {
       if (existingDescs.includes(row.description?.toLowerCase())) continue;
       const { id, created_at, updated_at, ...rest } = row;
-      // Para fijos y variables: reiniciar amount al presupuesto (los movimientos empiezan de cero cada mes)
+      // Para fijos y variables: amount=0 al nuevo mes; movimientos empiezan de cero
       const resetAmount = (table === 'fixed_expenses' || table === 'variable_expenses')
-        ? { amount: rest.budgeted_amount ?? rest.amount ?? 0 }
+        ? { amount: 0 }
         : {};
       try {
         await dbInsert(table, { ...rest, ...resetAmount, month: APP.currentMonth, year: APP.currentYear, status: 'pending' });
@@ -1577,13 +1623,16 @@ async function renderGastosVariables() {
   const sec = $('section-gastos-variables');
   const rows = await dbSelect('variable_expenses', { month: APP.currentMonth, year: APP.currentYear });
   APP.cache.varExpenses = rows;
-  const total          = rows.reduce((s,r) => s + (+r.amount||0), 0);
-  const totalBudgetedV = rows.reduce((s,r) => s + (+r.budgeted_amount || +r.amount||0), 0);
-  const totalDiffV     = total - totalBudgetedV;
 
-  // Agrupación por categoría
+  // Real desde movimientos; presupuesto desde budgeted_amount
+  const realMap       = await computeRealAmounts(rows);
+  const totalBudgetedV = rows.reduce((s,r) => s + (r.budgeted_amount != null ? +r.budgeted_amount : +r.amount || 0), 0);
+  const totalRealV     = rows.reduce((s,r) => s + (realMap[r.id] ?? 0), 0);
+  const globalDiffV    = totalBudgetedV - totalRealV;
+
+  // Agrupación por categoría (usando real)
   const byCat = {};
-  rows.forEach(r => { byCat[r.category||'Otros'] = (byCat[r.category||'Otros']||0) + (+r.amount||0); });
+  rows.forEach(r => { byCat[r.category||'Otros'] = (byCat[r.category||'Otros']||0) + (realMap[r.id]??0); });
   const catsSorted = Object.entries(byCat).sort((a,b) => b[1]-a[1]);
 
   sec.innerHTML = `
@@ -1592,8 +1641,10 @@ async function renderGastosVariables() {
         <h2 class="section-title">Gastos Variables</h2>
         <p class="section-subtitle">
           Presupuesto: <strong class="mono">${fmtARS(totalBudgetedV)}</strong>
-          · Real: <strong class="mono" style="color:${totalDiffV>0?'var(--danger)':totalDiffV<0?'var(--success)':'var(--danger)'}">${fmtARS(total)}</strong>
-          ${totalDiffV!==0?`· <span style="color:${totalDiffV>0?'var(--danger)':'var(--success)'}">${totalDiffV>0?'↑':'↓'} ${fmtARS(Math.abs(totalDiffV))}</span>`:''}
+          · Real: <strong class="mono" style="color:${globalDiffV<-0.01?'var(--danger)':'inherit'}">${fmtARS(totalRealV)}</strong>
+          ${Math.abs(globalDiffV)>0.01
+            ?`· <span style="color:${globalDiffV>0?'var(--success)':'var(--danger)'}">${globalDiffV>0?'↓ Resta':'↑ Excede'} ${fmtARS(Math.abs(globalDiffV))}</span>`
+            :''}
           · ${rows.length} registro${rows.length!==1?'s':''}
         </p>
       </div>
@@ -1606,7 +1657,7 @@ async function renderGastosVariables() {
         <div class="stat-card">
           <div class="card-label" style="font-size:.7rem">${cat}</div>
           <div class="card-value--sm mono" style="font-size:.95rem">${fmtARS(val)}</div>
-          <div class="card-sub">${total>0?fmtPct(val/total*100):''}</div>
+          <div class="card-sub">${totalRealV>0?fmtPct(val/totalRealV*100):''}</div>
         </div>`).join('')}
     </div>` : ''}
 
@@ -1638,23 +1689,35 @@ async function renderGastosVariables() {
         <tbody id="var-tbody">
           ${rows.length === 0
             ? `<tr><td colspan="7"><div class="table-empty">Sin gastos variables este mes.</div></td></tr>`
-            : rows.map(r => varRow(r)).join('')}
+            : rows.map(r => varRow(r, realMap[r.id] ?? 0)).join('')}
         </tbody>
       </table>
     </div>`;
 }
 
-function varRow(r) {
-  const budgeted  = +r.budgeted_amount || +r.amount || 0;
-  const real      = +r.amount || 0;
-  const diff      = real - budgeted;
-  const hasDiff   = budgeted > 0 && Math.abs(diff) >= 0.01;
-  const diffColor = diff > 0 ? 'var(--danger)' : 'var(--success)';
+function varRow(r, realAmount) {
+  const hasBudget = r.budgeted_amount != null;
+  const budget    = hasBudget ? +r.budgeted_amount : +r.amount || 0;
+  const real      = hasBudget ? realAmount : +r.amount || 0;
 
-  const budgetInfo = hasDiff
-    ? `<br><span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budgeted)}</span>
-       <span style="font-size:.7rem;margin-left:.35rem;color:${diffColor}">${diff>0?'↑':'↓'} ${fmtARS(Math.abs(diff))}</span>`
-    : '';
+  let amountCell;
+  if (!hasBudget) {
+    amountCell = `<strong>${fmtARS(real)}</strong>`;
+  } else {
+    const diff = budget - real;
+    let subLine;
+    if (Math.abs(diff) < 0.01) {
+      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)} · ✓ 100%</span>`;
+    } else if (diff > 0) {
+      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)}</span>
+        <span style="font-size:.7rem;margin-left:.3rem;color:var(--success)">↓ Resta ${fmtARS(diff)}</span>`;
+    } else {
+      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)}</span>
+        <span style="font-size:.7rem;margin-left:.3rem;color:var(--danger)">↑ Excede ${fmtARS(-diff)}</span>`;
+    }
+    amountCell = `<strong style="color:${diff<-0.01?'var(--danger)':'inherit'}">${fmtARS(real)}</strong>
+      <br>${subLine}`;
+  }
 
   return `<tr data-cat="${(r.category||'Otros').toLowerCase()}" data-desc="${r.description.toLowerCase()}" data-person="${(r.person||'').toLowerCase()}" data-method="${(r.payment_method||'').toLowerCase()}">
     <td><strong>${r.description}</strong></td>
@@ -1662,10 +1725,7 @@ function varRow(r) {
     <td style="font-size:.8rem">${r.person||'—'}</td>
     <td style="font-size:.8rem">${r.payment_method||'—'}</td>
     <td style="font-size:.8rem">${r.expense_date?fmtDate(r.expense_date):'—'}</td>
-    <td style="text-align:right" class="mono">
-      <strong style="color:${hasDiff?(diff>0?'var(--danger)':'var(--success)'):'inherit'}">${fmtARS(real)}</strong>
-      ${budgetInfo}
-    </td>
+    <td style="text-align:right" class="mono">${amountCell}</td>
     <td>
       <div class="table-actions">
         <button class="icon-btn" title="Agregar movimiento al gasto real" onclick="openMovementForm('${r.id}','variable','${r.description.replace(/'/g,"\\'")}')">±</button>
@@ -1752,7 +1812,7 @@ async function saveVar() {
   if (isNaN(budget) || budget < 0) return toast('Monto inválido', 'warning');
   try {
     await dbInsert('variable_expenses', {
-      description: desc, amount: budget, budgeted_amount: budget,
+      description: desc, amount: 0, budgeted_amount: budget,
       category: $('vr-cat').value, person: $('vr-person').value,
       payment_method: $('vr-method').value, expense_date: $('vr-date').value || null,
       notes: $('vr-notes').value.trim() || null,
