@@ -1321,25 +1321,26 @@ async function renderGastosFijos() {
 function fixedRow(r, realAmount) {
   const hasBudget = r.budgeted_amount != null;
   const budget    = hasBudget ? +r.budgeted_amount : +r.amount || 0;
-  const real      = hasBudget ? realAmount : +r.amount || 0;
+  const real      = hasBudget ? (realAmount ?? 0) : +r.amount || 0;
 
   let amountCell;
   if (!hasBudget) {
+    // Sin presupuesto cargado: mostrar amount directo
     amountCell = `<strong>${fmtARS(real)}</strong>`;
   } else {
     const diff = budget - real;   // positivo = restante, negativo = excedido
-    let subLine;
+    let diffSpan;
     if (Math.abs(diff) < 0.01) {
-      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)} · ✓ 100%</span>`;
+      diffSpan = `<span style="color:var(--text-3)">✓ 100%</span>`;
     } else if (diff > 0) {
-      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)}</span>
-        <span style="font-size:.7rem;margin-left:.3rem;color:var(--success)">↓ Resta ${fmtARS(diff)}</span>`;
+      diffSpan = `<span style="color:var(--success)">↓ Resta ${fmtARS(diff)}</span>`;
     } else {
-      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)}</span>
-        <span style="font-size:.7rem;margin-left:.3rem;color:var(--danger)">↑ Excede ${fmtARS(-diff)}</span>`;
+      diffSpan = `<span style="color:var(--danger)">↑ Excede ${fmtARS(-diff)}</span>`;
     }
-    amountCell = `<strong style="color:${diff<-0.01?'var(--danger)':'inherit'}">${fmtARS(real)}</strong>
-      <br>${subLine}`;
+    // Main: presupuesto; sub: real + diferencia
+    amountCell = `<strong style="color:${diff<-0.01?'var(--danger)':'inherit'}">${fmtARS(budget)}</strong>
+      <br><span style="font-size:.7rem;color:var(--text-3)">Real: ${fmtARS(real)}</span>
+      <span style="font-size:.7rem;margin-left:.3rem">${diffSpan}</span>`;
   }
 
   const statusBadge = r.status === 'paid'
@@ -1698,25 +1699,24 @@ async function renderGastosVariables() {
 function varRow(r, realAmount) {
   const hasBudget = r.budgeted_amount != null;
   const budget    = hasBudget ? +r.budgeted_amount : +r.amount || 0;
-  const real      = hasBudget ? realAmount : +r.amount || 0;
+  const real      = hasBudget ? (realAmount ?? 0) : +r.amount || 0;
 
   let amountCell;
   if (!hasBudget) {
     amountCell = `<strong>${fmtARS(real)}</strong>`;
   } else {
     const diff = budget - real;
-    let subLine;
+    let diffSpan;
     if (Math.abs(diff) < 0.01) {
-      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)} · ✓ 100%</span>`;
+      diffSpan = `<span style="color:var(--text-3)">✓ 100%</span>`;
     } else if (diff > 0) {
-      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)}</span>
-        <span style="font-size:.7rem;margin-left:.3rem;color:var(--success)">↓ Resta ${fmtARS(diff)}</span>`;
+      diffSpan = `<span style="color:var(--success)">↓ Resta ${fmtARS(diff)}</span>`;
     } else {
-      subLine = `<span style="font-size:.7rem;color:var(--text-3)">Pres: ${fmtARS(budget)}</span>
-        <span style="font-size:.7rem;margin-left:.3rem;color:var(--danger)">↑ Excede ${fmtARS(-diff)}</span>`;
+      diffSpan = `<span style="color:var(--danger)">↑ Excede ${fmtARS(-diff)}</span>`;
     }
-    amountCell = `<strong style="color:${diff<-0.01?'var(--danger)':'inherit'}">${fmtARS(real)}</strong>
-      <br>${subLine}`;
+    amountCell = `<strong style="color:${diff<-0.01?'var(--danger)':'inherit'}">${fmtARS(budget)}</strong>
+      <br><span style="font-size:.7rem;color:var(--text-3)">Real: ${fmtARS(real)}</span>
+      <span style="font-size:.7rem;margin-left:.3rem">${diffSpan}</span>`;
   }
 
   return `<tr data-cat="${(r.category||'Otros').toLowerCase()}" data-desc="${r.description.toLowerCase()}" data-person="${(r.person||'').toLowerCase()}" data-method="${(r.payment_method||'').toLowerCase()}">
