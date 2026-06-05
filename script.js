@@ -1715,6 +1715,7 @@ async function renderTarjetas() {
     cardTotals[t.card_id] = (cardTotals[t.card_id]||0) + amt;
   });
   const totalGeneral = Object.values(cardTotals).reduce((s,v)=>s+v, 0);
+  APP.cache.cardTotals = { ...cardTotals };
 
   if (cards.length === 0) {
     sec.innerHTML = `
@@ -1821,6 +1822,17 @@ async function showCardTransactions(cardId, txnsParam = null, cardsParam = null)
   const paidUSDinARS  = filteredTxns.filter(t=>t.currency==='USD'&&t.status==='paid').reduce((s,t)=>s+txnARS(t), 0);
   const totalPaid     = paidARS + paidUSDinARS;
   const totalPending  = totalCombined - totalPaid;
+
+  // Si los datos son frescos (click del usuario), sincronizar card visual y subtítulo
+  if (!txnsParam) {
+    if (!APP.cache.cardTotals) APP.cache.cardTotals = {};
+    APP.cache.cardTotals[cardId] = totalCombined;
+    const amountEl = document.querySelector(`#card-visual-${cardId} .card-amount-value`);
+    if (amountEl) amountEl.textContent = fmtARS(totalCombined);
+    const newOverall = Object.values(APP.cache.cardTotals).reduce((s,v)=>s+v, 0);
+    const subtitleEl = document.querySelector('#section-tarjetas .section-subtitle strong');
+    if (subtitleEl) subtitleEl.textContent = fmtARS(newOverall);
+  }
 
   const panel = $('card-transactions-panel');
   panel.innerHTML = `
