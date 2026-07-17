@@ -1096,6 +1096,10 @@ async function renderDashboard() {
       ${alerts.map(a=>`<div class="alert-item alert-item--${a.type}"><span>${a.type==='danger'?'🔴':'🟡'}</span> ${a.msg}</div>`).join('')}
     </div>` : ''}
 
+    <div style="display:flex;justify-content:flex-end;margin:.75rem 0">
+      <button class="btn btn--outline btn--sm" onclick="openCloseMonthModal()" title="Calcula el sobrante de gastos fijos y variables y lo pasa como ingreso al mes siguiente">🔒 Cerrar mes</button>
+    </div>
+
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:1.25rem">
       <div class="chart-container">
         <div class="chart-title">Distribución de gastos</div>
@@ -1140,6 +1144,130 @@ function renderExpensePie(fixed, variable, cards, install) {
 }
 
 /* ============================================================
+   16b. CIERRE DE MES
+   ============================================================ */
+
+// Devuelve { month, year } del mes siguiente al indicado (maneja diciembre -> enero).
+function getNextMonthYear(month, year) {
+  let m = month + 1, y = year;
+  if (m > 12) { m = 1; y++; }
+  return { month: m, year: y };
+}
+
+// Calcula el sobrante real de gastos fijos + variables de un mes:
+// sobranteGasto = max(0, netBudget - spentReal), sumado por fila.
+async function calculateMonthLeftover(month, year) {
+  const [fixed, variable] = await Promise.all([
+    dbSelect('fixed_expenses',    { month, year }),
+    dbSelect('variable_expenses', { month, year })
+  ]);
+  const [fixedSummary, varSummary] = await Promise.all([
+    computeExpenseMovementSummary(fixed),
+    computeExpenseMovementSummary(variable)
+  ]);
+
+  let totalBudgeted = 0, totalReal = 0, totalReduction = 0, totalLeftover = 0;
+  [...fixed.map(r => ({ r, s: fixedSummary[r.id] })), ...variable.map(r => ({ r, s: varSummary[r.id] }))]
+    .forEach(({ r, s }) => {
+      const budgetGross = getExpenseBudget(r);
+      const reduction   = s?.reduction ?? 0;
+      const spentReal   = s?.spentReal ?? 0;
+      const netBudget   = s?.netBudget ?? Math.max(0, budgetGross - reduction);
+      totalBudgeted  += budgetGross;
+      totalReal      += spentReal;
+      totalReduction += reduction;
+      totalLeftover  += Math.max(0, netBudget - spentReal);
+    });
+
+  return { month, year, totalBudgeted, totalReal, totalReduction, totalLeftover };
+}
+
+// Cierra un mes: calcula el sobrante y lo pasa como ingreso "Resto del mes pasado"
+// al mes siguiente. No toca gastos, tarjetas, ingresos manuales ni movimientos.
+// Si ya existe un ingreso automático para ese mes destino, lo actualiza (no duplica).
+async function closeMonthAndCarryOver(month, year) {
+  const summary = await calculateMonthLeftover(month, year);
+  if (summary.totalLeftover <= 0) return { ...summary, created: false, updated: false };
+
+  const next = getNextMonthYear(month, year);
+  const matches = await dbSelect('incomes', {
+    month: next.month, year: next.year, description: 'Resto del mes pasado'
+  });
+  const existing = matches[0];
+  const notes = `Generado automáticamente desde cierre de mes ${String(month).padStart(2,'0')}/${year}`;
+
+  if (existing) {
+    await dbUpdate('incomes', existing.id, {
+      amount: summary.totalLeftover, person: 'Ambos', notes,
+      source: 'month_closeover', linked_month: month, linked_year: year
+    });
+  } else {
+    await dbInsert('incomes', {
+      description: 'Resto del mes pasado', amount: summary.totalLeftover,
+      person: 'Ambos', income_date: null, notes,
+      source: 'month_closeover', linked_month: month, linked_year: year,
+      month: next.month, year: next.year
+    });
+  }
+  return { ...summary, nextMonth: next.month, nextYear: next.year, updated: !!existing, created: !existing };
+}
+
+async function openCloseMonthModal() {
+  const month = APP.currentMonth, year = APP.currentYear;
+  const mesLabel = `${monthName(month)} ${year}`;
+
+  openModal(`<h2 class="modal-title">Cerrar mes · ${mesLabel}</h2>
+    <div style="display:flex;align-items:center;gap:.5rem;color:var(--text-3);padding:1rem 0"><span class="spinner"></span> Calculando sobrante...</div>`);
+
+  const summary = await calculateMonthLeftover(month, year);
+  const next = getNextMonthYear(month, year);
+  const nextLabel = `${monthName(next.month)} ${next.year}`;
+
+  if (summary.totalLeftover <= 0) {
+    openModal(`
+      <h2 class="modal-title">Cerrar mes · ${mesLabel}</h2>
+      <p style="color:var(--text-2);margin-bottom:1rem">No hay sobrante para transferir al mes siguiente.</p>
+      <div class="form-actions">
+        <button class="btn btn--ghost" onclick="closeModal()">Cerrar</button>
+      </div>`);
+    return;
+  }
+
+  openModal(`
+    <h2 class="modal-title">Cerrar mes · ${mesLabel}</h2>
+    <div style="display:flex;flex-direction:column;gap:.5rem;margin-bottom:1.25rem">
+      <div style="display:flex;justify-content:space-between;font-size:.85rem"><span style="color:var(--text-3)">Total presupuestado</span><span class="mono">${fmtARS(summary.totalBudgeted)}</span></div>
+      <div style="display:flex;justify-content:space-between;font-size:.85rem"><span style="color:var(--text-3)">Total real gastado</span><span class="mono">${fmtARS(summary.totalReal)}</span></div>
+      <div style="display:flex;justify-content:space-between;font-size:.85rem"><span style="color:var(--text-3)">Total descuentos</span><span class="mono">${fmtARS(summary.totalReduction)}</span></div>
+      <div style="display:flex;justify-content:space-between;font-size:.9rem;font-weight:700;border-top:1px solid var(--border);padding-top:.5rem;margin-top:.25rem">
+        <span>Total sobrante a transferir</span><span class="mono" style="color:var(--success)">${fmtARS(summary.totalLeftover)}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:.85rem"><span style="color:var(--text-3)">Mes destino del ingreso</span><span>${nextLabel}</span></div>
+    </div>
+    <p style="font-size:.8rem;color:var(--text-2);margin-bottom:1.25rem">Se creará un ingreso en el mes siguiente llamado "Resto del mes pasado" por ${fmtARS(summary.totalLeftover)}. Esta acción no borra ni modifica los gastos del mes actual.</p>
+    <div class="form-actions">
+      <button class="btn btn--ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn--primary" onclick="confirmCloseMonth(${month},${year})">Confirmar cierre</button>
+    </div>`);
+}
+
+async function confirmCloseMonth(month, year) {
+  try {
+    const result = await closeMonthAndCarryOver(month, year);
+    closeModal();
+    if (result.totalLeftover <= 0) {
+      toast('No hay sobrante para transferir al mes siguiente.', 'info');
+      return;
+    }
+    toast(`Ingreso "Resto del mes pasado" ${result.updated ? 'actualizado' : 'creado'} en ${monthName(result.nextMonth)} ${result.nextYear} ✓`);
+    loadCurrentSection();
+  } catch (e) {
+    console.error('[closeMonthAndCarryOver] Error:', e);
+    toast('Error al cerrar el mes. Revisá la consola.', 'error');
+  }
+}
+
+/* ============================================================
    17. INGRESOS
    ============================================================ */
 async function renderIngresos() {
@@ -1181,8 +1309,9 @@ async function renderIngresos() {
 }
 
 function ingresosRow(r) {
+  const isAuto = r.source === 'month_closeover';
   return `<tr>
-    <td><strong>${r.description}</strong></td>
+    <td><strong>${r.description}</strong>${isAuto ? ' <span class="badge badge--neutral" title="Generado automáticamente desde Cierre de mes">🔒 Automático</span>' : ''}</td>
     <td><span class="badge badge--info">${r.person||'—'}</span></td>
     <td>${r.income_date ? fmtDate(r.income_date) : '—'}</td>
     <td style="text-align:right" class="mono" style="color:var(--success)"><strong>${fmtARS(r.amount)}</strong></td>

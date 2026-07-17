@@ -463,6 +463,17 @@ ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS due_day            SMALLINT;
 ALTER TABLE credit_cards ADD COLUMN IF NOT EXISTS due_month_offset   SMALLINT DEFAULT 0;
 
 -- ============================================================
+-- MIGRACIÓN: Cierre de mes (sobrante -> ingreso "Resto del mes pasado")
+-- Ejecutar en Supabase Dashboard > SQL Editor
+-- Columnas opcionales; no borran ni modifican datos existentes.
+-- source = 'month_closeover' identifica ingresos generados automáticamente
+-- por el cierre de mes; linked_month/linked_year apuntan al mes cerrado.
+-- ============================================================
+ALTER TABLE incomes ADD COLUMN IF NOT EXISTS source       TEXT;
+ALTER TABLE incomes ADD COLUMN IF NOT EXISTS linked_month SMALLINT;
+ALTER TABLE incomes ADD COLUMN IF NOT EXISTS linked_year  SMALLINT;
+
+-- ============================================================
 -- ACTIVAR REALTIME (ejecutar en Supabase Dashboard > Replication)
 -- O agregar tablas en: Settings > API > Realtime
 -- ============================================================
